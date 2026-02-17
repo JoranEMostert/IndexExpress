@@ -10,7 +10,7 @@ Privacy-first web research with tiered retrieval/report modes, source-cited outp
 ## Feature Labels
 
 - `peek`: 5 URLs, no LLM report
-- `skim`: configurable parallel skim agents + concise cited report
+- `skim`: configurable parallel skim agents returning per-agent reports
 - `analyze`: configurable multi-agent skim passes + multi-merge contradiction synthesis
 - `research`: deep multi-agent flow with pair synthesis blocks (no extra global summarizer)
 - Citation contract: inline `(n)` references + final `Sources` list
@@ -21,7 +21,7 @@ Privacy-first web research with tiered retrieval/report modes, source-cited outp
 | Tier | Best For | Retrieval | LLM | Output |
 |---|---|---|---|---|
 | `peek` | Quick scanning | 5 URLs | No | Source list |
-| `skim` | Fast grounded answer | Parallel multi-query retrieval | Single synthesis | Cited report |
+| `skim` | Fast grounded answer | Parallel multi-query retrieval | Per-agent report generation | `skim_reports` + aggregate sources |
 | `analyze` | Compare viewpoints | Nx skim (configurable) | Multi-merge synthesis | Contradiction-aware report |
 | `research` | Deep investigation | Multi-query parallel retrieval | Pair synthesis blocks | Comprehensive stitched output |
 
@@ -33,7 +33,7 @@ Client (MCP or TUI)
     v
 MCP Server (server.py)
     |- peek      -> PeekAgent (search-only)
-    |- skim      -> SkimAgent (parallel retrieval + report)
+    |- skim      -> SkimAgent (parallel retrieval + per-agent reports)
     |- analyze   -> AnalyzeOrchestrator (configurable skim runs + multi-merge)
     |- research  -> DeepSearchOrchestrator (sub-queries + pair synthesis blocks)
     |
@@ -113,16 +113,21 @@ UI goals:
 - clear progress prompts
 - friendly error messages
 - no MCP protocol noise in normal output
-- streaming report output in TUI report pane
+- simple command-loop UX with mock MCP-consumer summaries for multi-report modes
 
 ## Report Contract
 
-All LLM-backed tiers (`skim`, `analyze`, `research`) are expected to output:
+LLM-backed modes (`skim`, `analyze`, `research`) are expected to output:
 
 - `Report` body
 - inline citations like `(1)`, `(2)`
 - final `Sources` section with indexed URLs
 - sanitized output with no leaked `<think>...</think>` blocks
+
+`skim` response specifics:
+
+- primary deliverable is `skim_reports` (one report per skim agent)
+- top-level `report` is a status string like `Returned N skim reports.`
 
 `research` response specifics:
 
@@ -172,6 +177,10 @@ Legacy alias still supported:
   - lower `RESEARCH_MAX_SUB_QUERIES` and/or `MAX_CONCURRENT_AGENTS`
 - Citation quality issues:
   - report generator performs a citation-repair pass automatically
+
+## Todo
+
+- Manual mode: fetch provider documentation on retrieving whole pages as Markdown and add an explicit manual workflow.
 
 ## Project Map
 

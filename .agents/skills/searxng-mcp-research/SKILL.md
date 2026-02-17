@@ -12,7 +12,7 @@ metadata:
 
 - Use the local ExpressIndex MCP server at `http://localhost:8000/mcp`.
 - Use `peek` for direct URL output with optional fetched page markdown.
-- Use `skim` for parallel retrieval agents plus a concise cited report.
+- Use `skim` for parallel retrieval agents that return per-agent `skim_reports`.
 - Use `analyze` for configurable multi-agent skim passes plus parallel contradiction-merge variants.
 - Use `research` for deep multi-agent investigation with pair synthesis blocks (no extra global summarizer pass).
 - Use `list_models` to inspect available model IDs from the configured OpenAI-compatible API.
@@ -32,7 +32,7 @@ Use this skill when a task needs web research through your self-hosted ExpressIn
    - JSON-RPC `tools/list`
 3. Pick mode:
     - URL-only quick scan: `tools/call` -> `peek`
-    - Fast cited report: `tools/call` -> `skim`
+    - Parallel skim bundle: `tools/call` -> `skim` (returns `skim_reports` + aggregate `sources`)
     - Contradiction-focused mid-depth report: `tools/call` -> `analyze`
    - Comprehensive deep research: `tools/call` -> `research` (returns `cluster_reports`, `synthesis_reports`, and `final_report` as a report-count message)
 4. Optional diagnostics:

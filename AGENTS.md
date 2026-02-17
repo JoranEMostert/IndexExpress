@@ -172,6 +172,7 @@ pytest -q tests/test_think_tag_sanitization.py tests/test_research_subquery_coun
 - Health endpoint: `GET /health`.
 - Keep request/response payload keys backward compatible unless explicitly changing API.
 - Report modes should keep citation markers and a `Sources` section.
+- `skim` should return per-agent `skim_reports`; avoid collapsing to one backend summary report.
 - Do not leak `<think>...</think>` content in any user-visible output.
 
 ## 10) High-Value Files to Read First
