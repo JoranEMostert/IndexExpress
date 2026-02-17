@@ -24,6 +24,8 @@ class SkimResult:
     query: str
     report: str
     sources: List[Dict[str, str]]
+    skim_reports: List[Dict[str, Any]]
+    skim_agent_runs: List[Dict[str, Any]]
     sources_count: int
     search_time: float
 
@@ -113,9 +115,13 @@ class SkimAgent:
 
         search_batches = await asyncio.gather(*[run_skim_query(q) for q in skim_queries])
 
-        sources = []
-        excluded = exclude_urls or set()
+        excluded = set(exclude_urls or set())
+
+        # First pass: allocate mostly-distinct URLs per skim agent.
+        allocated_sources: List[List[Dict[str, Any]]] = []
+        used_urls: set[str] = set()
         for batch in search_batches:
+            candidate_rows: List[Dict[str, Any]] = []
             for item in batch:
                 row = {
                     "url": item.url,
@@ -124,37 +130,99 @@ class SkimAgent:
                     "engine": item.engine,
                 }
                 normalized = row["url"].strip().lower().rstrip("/")
-                if normalized in excluded:
+                if not normalized or normalized in excluded:
                     continue
-                sources.append(row)
+                candidate_rows.append(row)
 
-        unique_sources = dedupe_sources(sources, limit=target)
+            deduped_candidates = dedupe_sources(candidate_rows, limit=target * 3)
+            unique_for_agent: List[Dict[str, Any]] = []
+            for src in deduped_candidates:
+                normalized = src.get("url", "").strip().lower().rstrip("/")
+                if not normalized or normalized in used_urls:
+                    continue
+                unique_for_agent.append(src)
+                used_urls.add(normalized)
+                if len(unique_for_agent) >= target:
+                    break
+            allocated_sources.append(unique_for_agent)
 
-        fetched = await self.searxng.enrich_sources_with_content(
-            unique_sources,
-            max_length=5000,
-            max_parallel=6,
-        )
+        async def run_agent_report(agent_idx: int, agent_query: str, unique_sources: List[Dict[str, Any]]) -> Dict[str, Any]:
+            started = time.time()
+            if not unique_sources:
+                return {
+                    "agent": agent_idx,
+                    "query": agent_query,
+                    "report": "No unique sources collected for this skim agent.",
+                    "sources": [],
+                    "sources_count": 0,
+                    "run": {
+                        "agent": agent_idx,
+                        "query": agent_query,
+                        "status": "empty",
+                        "duration_s": round(time.time() - started, 2),
+                    },
+                }
 
-        enriched_sources = []
-        for source in fetched:
-            merged = dict(source)
-            page_text = (source.get("fetched_markdown") or "").strip()
-            if page_text:
-                merged["content"] = page_text
-            enriched_sources.append(merged)
+            fetched = await self.searxng.enrich_sources_with_content(
+                unique_sources,
+                max_length=5000,
+                max_parallel=6,
+            )
 
-        report = await self.reporter.write_report(
-            query=query,
-            sources=enriched_sources,
-            style="concise but complete",
-        )
+            enriched_sources = []
+            for source in fetched:
+                merged = dict(source)
+                page_text = (source.get("fetched_markdown") or "").strip()
+                if page_text:
+                    merged["content"] = page_text
+                enriched_sources.append(merged)
+
+            report = await self.reporter.write_report(
+                query=agent_query,
+                sources=enriched_sources,
+                style="concise but complete",
+            )
+            return {
+                "agent": agent_idx,
+                "query": agent_query,
+                "report": report.report,
+                "sources": report.sources,
+                "sources_count": len(unique_sources),
+                "run": {
+                    "agent": agent_idx,
+                    "query": agent_query,
+                    "status": "ok",
+                    "duration_s": round(time.time() - started, 2),
+                },
+            }
+
+        tasks = [
+            asyncio.create_task(run_agent_report(idx + 1, skim_queries[idx], allocated_sources[idx]))
+            for idx in range(len(skim_queries))
+        ]
+        skim_reports = await asyncio.gather(*tasks)
+
+        aggregate_sources: List[Dict[str, Any]] = []
+        skim_agent_runs: List[Dict[str, Any]] = []
+        for item in skim_reports:
+            aggregate_sources.extend(item.get("sources", []))
+            run_meta = item.get("run")
+            if isinstance(run_meta, dict):
+                skim_agent_runs.append(run_meta)
+
+        deduped_aggregate = dedupe_sources(aggregate_sources, limit=max(20, target * self.agent_count))
+        if self.agent_count == 1 and skim_reports:
+            summary_report = skim_reports[0].get("report", "")
+        else:
+            summary_report = f"Returned {len(skim_reports)} skim reports."
 
         return SkimResult(
             query=query,
-            report=report.report,
-            sources=report.sources,
-            sources_count=len(unique_sources),
+            report=summary_report,
+            sources=deduped_aggregate,
+            skim_reports=skim_reports,
+            skim_agent_runs=skim_agent_runs,
+            sources_count=len(deduped_aggregate),
             search_time=time.time() - start_time,
         )
 

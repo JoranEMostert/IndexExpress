@@ -163,7 +163,7 @@ class MCPRequestHandler:
                 },
                 {
                     'name': 'skim',
-                    'description': 'Parallel skim agents gather diversified sources and produce a cited report.',
+                    'description': 'Parallel skim agents gather diversified sources and return per-agent reports.',
                     'inputSchema': {
                         'type': 'object',
                         'properties': {
@@ -305,6 +305,13 @@ class MCPRequestHandler:
                     max_results=arguments.get('max_results')
                 )
                 safe_report = _strip_think_tags(result.report)
+                skim_reports = [
+                    {
+                        **item,
+                        'report': _strip_think_tags(item.get('report', '')),
+                    }
+                    for item in result.skim_reports
+                ]
                 return {
                     'content': [
                         {
@@ -312,6 +319,8 @@ class MCPRequestHandler:
                             'text': json.dumps({
                                 'query': result.query,
                                 'report': safe_report,
+                                'skim_reports': skim_reports,
+                                'skim_agent_runs': result.skim_agent_runs,
                                 'sources': result.sources,
                                 'sources_count': result.sources_count,
                                 'search_time': round(result.search_time, 2)

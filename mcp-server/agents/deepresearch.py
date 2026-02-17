@@ -96,7 +96,15 @@ class AnalyzeOrchestrator:
             contradiction_reports=merge_variants,
         )
 
-        primary_a = agent_runs[0] if agent_runs else SkimResult(query=query, report="", sources=[], sources_count=0, search_time=0.0)
+        primary_a = agent_runs[0] if agent_runs else SkimResult(
+            query=query,
+            report="",
+            sources=[],
+            skim_reports=[],
+            skim_agent_runs=[],
+            sources_count=0,
+            search_time=0.0,
+        )
         primary_b = agent_runs[1] if len(agent_runs) > 1 else primary_a
 
         agent_reports = [

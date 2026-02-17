@@ -2,15 +2,17 @@ import argparse
 import asyncio
 import json
 import re
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
 
 import aiohttp
-from rich.text import Text
-from textual.app import App, ComposeResult
-from textual.containers import Horizontal, Vertical
-from textual.widgets import Button, Footer, Header, Input, RichLog, Select, Static
+from prompt_toolkit import PromptSession
+from prompt_toolkit.patch_stdout import patch_stdout
+from rich.console import Console
+from rich.panel import Panel
+from rich.table import Table
 
 
 MCP_URL_DEFAULT = "http://localhost:8000/mcp"
@@ -30,7 +32,7 @@ def _sanitize_payload(payload: dict[str, Any]) -> dict[str, Any]:
         if key in sanitized and isinstance(sanitized[key], str):
             sanitized[key] = _strip_think_tags(sanitized[key])
 
-    for list_key in ("cluster_reports", "synthesis_reports", "merge_reports"):
+    for list_key in ("cluster_reports", "synthesis_reports", "merge_reports", "skim_reports"):
         report_rows = sanitized.get(list_key)
         if isinstance(report_rows, list):
             patched = []
@@ -74,7 +76,7 @@ async def call_mcp_tool(
 
     body = {
         "jsonrpc": "2.0",
-        "id": 1,
+        "id": str(uuid.uuid4()),
         "method": "tools/call",
         "params": {"name": mode, "arguments": arguments},
     }
@@ -97,9 +99,37 @@ async def call_mcp_tool(
     return QueryResult(mode=mode, payload=payload)
 
 
+async def call_agent_status(mcp_url: str) -> dict[str, Any]:
+    body = {
+        "jsonrpc": "2.0",
+        "id": str(uuid.uuid4()),
+        "method": "tools/call",
+        "params": {"name": "agent_status", "arguments": {}},
+    }
+    async with aiohttp.ClientSession() as session:
+        async with session.post(mcp_url, json=body, timeout=aiohttp.ClientTimeout(total=10)) as response:
+            raw = await response.text()
+            if response.status != 200:
+                raise RuntimeError(f"agent_status failed ({response.status}): {raw}")
+
+    message = json.loads(raw)
+    if "error" in message:
+        err = message["error"].get("message", "Unknown error")
+        raise RuntimeError(err)
+
+    result_blob = message.get("result", {}).get("content", [])
+    if not result_blob:
+        return {}
+    text = result_blob[0].get("text", "{}")
+    try:
+        return json.loads(text)
+    except Exception:
+        return {}
+
+
 def markdown_from_result(query: str, mode: str, payload: dict[str, Any]) -> str:
     lines = [f"# ExpressIndex {mode.title()} Report", "", f"Query: {query}", ""]
-    report = payload.get("report") or payload.get("final_report")
+    report = _tui_consumer_summary(mode, payload) or payload.get("report") or payload.get("final_report")
     if report:
         lines.append(report)
     else:
@@ -122,134 +152,325 @@ def _source_lines(payload: dict[str, Any]) -> list[str]:
     return lines
 
 
-class ExpressIndexTUI(App):
-    CSS = """
-    Screen { layout: vertical; }
-    #controls { height: 3; }
-    #query { width: 1fr; }
-    #status { height: 3; border: round $accent; padding: 0 1; }
-    #report { height: 1fr; border: round $primary; }
-    #sources { height: 14; border: round $secondary; }
-    #leftcol { width: 34%; }
-    #rightcol { width: 66%; }
-    #body { height: 1fr; }
-    """
+def _detail_lines(mode: str, payload: dict[str, Any]) -> list[str]:
+    if mode == "skim":
+        lines = [
+            f"skim_reports: {len(payload.get('skim_reports', []))}",
+            f"sources_count: {payload.get('sources_count', 0)}",
+        ]
+        runs = payload.get("skim_agent_runs", [])
+        if isinstance(runs, list):
+            for run in runs:
+                if isinstance(run, dict):
+                    lines.append(
+                        f"- run agent {run.get('agent', '?')}: {run.get('status', 'unknown')} "
+                        f"{run.get('duration_s', '?')}s :: {run.get('query', '')}"
+                    )
+        for item in payload.get("skim_reports", []):
+            lines.append(f"- agent {item.get('agent', '?')}: {item.get('sources_count', 0)} sources :: {item.get('query', '')}")
+        return lines
 
-    BINDINGS = [
-        ("q", "quit", "Quit"),
-        ("r", "run_query", "Run"),
-        ("s", "save_report", "Save Markdown"),
-    ]
+    if mode == "research":
+        lines = [
+            f"sub_queries: {len(payload.get('sub_queries', []))}",
+            f"cluster_reports: {len(payload.get('cluster_reports', []))}",
+            f"synthesis_reports: {len(payload.get('synthesis_reports', []))}",
+            f"agents_used: {payload.get('agents_used', 0)}",
+            f"total_sources: {payload.get('total_sources', 0)}",
+        ]
+        for run in payload.get("agent_runs", []):
+            q = run.get("query", "")
+            d = run.get("duration_s", "?")
+            s = run.get("status", "unknown")
+            lines.append(f"- {s} {d}s :: {q}")
+        return lines
 
-    def __init__(self, mcp_url: str):
-        super().__init__()
-        self.mcp_url = mcp_url
-        self._running = False
-        self._last_query = ""
-        self._last_mode = "peek"
-        self._last_payload: dict[str, Any] = {}
+    if mode == "analyze":
+        lines = [
+            f"analyze_agents: {payload.get('agent_count', 0)}",
+            f"merge_agents: {payload.get('merge_agent_count', 0)}",
+        ]
+        lines.extend(_source_lines(payload))
+        return lines
 
-    def compose(self) -> ComposeResult:
-        yield Header(show_clock=True)
-        with Horizontal(id="controls"):
-            yield Select(((m, m.title()) for m in MODES), value="peek", id="mode")
-            yield Input(placeholder="Type your query and press Run...", id="query")
-            yield Button("Run", id="run", variant="primary")
-            yield Button("Save MD", id="save", variant="success")
+    lines = _source_lines(payload)
+    if not lines and payload.get("sources_count") is not None:
+        lines.append(f"sources_count: {payload.get('sources_count')}")
+    return lines
 
-        with Horizontal(id="body"):
-            with Vertical(id="leftcol"):
-                yield Static("Ready.", id="status")
-                yield RichLog(id="sources", wrap=True, highlight=True, markup=False)
-            with Vertical(id="rightcol"):
-                yield RichLog(id="report", wrap=True, highlight=True, markup=False)
 
-        yield Footer()
+def _extract_signal_lines(text: str, max_lines: int = 4) -> list[str]:
+    lines: list[str] = []
+    for raw in (text or "").splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        lowered = line.lower()
+        if lowered in {"report", "sources", "executive summary", "core findings", "final conclusions"}:
+            continue
+        if line.startswith("#"):
+            continue
+        if lowered.startswith("sources"):
+            continue
+        lines.append(line)
+        if len(lines) >= max_lines:
+            break
+    return lines
 
-    def _set_status(self, message: str) -> None:
-        self.query_one("#status", Static).update(message)
 
-    async def action_run_query(self) -> None:
-        if self._running:
-            return
-        await self._run()
+def _tui_consumer_summary(mode: str, payload: dict[str, Any]) -> str:
+    """TUI-only synthesis that mimics an MCP consumer reading many reports."""
+    if mode == "peek":
+        return ""
 
-    async def on_button_pressed(self, event: Button.Pressed) -> None:
-        if event.button.id == "run":
-            await self._run()
-        elif event.button.id == "save":
-            await self.action_save_report()
+    if mode == "skim":
+        reports = payload.get("skim_reports", [])
+        if not reports:
+            return payload.get("report", "No skim reports returned.")
+        lines = [
+            "# Final Answer",
+            "",
+            f"Synthesized from {len(reports)} skim reports.",
+            "",
+            "## Highlights Across Skim Agents",
+        ]
+        for item in reports:
+            agent = item.get("agent", "?")
+            query = item.get("query", "")
+            points = _extract_signal_lines(item.get("report", ""), max_lines=2)
+            lines.append(f"- Agent {agent} ({query})")
+            for point in points:
+                lines.append(f"  - {point}")
+        lines.extend(["", "## Raw Skim Reports"])
+        return "\n".join(lines).strip()
 
-    async def _run(self) -> None:
-        query = self.query_one("#query", Input).value.strip()
-        mode = str(self.query_one("#mode", Select).value)
-        if not query:
-            self._set_status("Please enter a query.")
-            return
+    if mode == "research":
+        blocks = payload.get("synthesis_reports", [])
+        if not blocks:
+            return payload.get("final_report", "No synthesis reports were returned.")
 
-        report_log = self.query_one("#report", RichLog)
-        sources_log = self.query_one("#sources", RichLog)
-        report_log.clear()
-        sources_log.clear()
-        self._running = True
-        self._set_status(f"Running {mode}...")
+        lines = [
+            "# Final Answer",
+            "",
+            f"Synthesized from {len(blocks)} research report blocks.",
+            "",
+            "## Key Findings Across Blocks",
+        ]
+        for item in blocks:
+            group = item.get("group", "?")
+            queries = ", ".join(item.get("queries", []))
+            signals = _extract_signal_lines(item.get("report", ""), max_lines=2)
+            title = f"- Block {group}"
+            if queries:
+                title += f" ({queries})"
+            lines.append(title)
+            for point in signals:
+                lines.append(f"  - {point}")
 
-        spinner_task = asyncio.create_task(self._spinner(mode))
-        try:
-            result = await call_mcp_tool(mode=mode, query=query, mcp_url=self.mcp_url)
-            self._last_query = query
-            self._last_mode = mode
-            self._last_payload = result.payload
+        lines.extend(
+            [
+                "",
+                "## What To Do With These Reports",
+                "- Use this final answer for decision-making.",
+                "- Use the raw synthesis blocks below to inspect disagreements and citations.",
+                "",
+                "## Raw Synthesis Blocks",
+            ]
+        )
+        return "\n".join(lines).strip()
 
-            await self._stream_payload(result.payload, report_log, sources_log)
-            count = result.payload.get("sources_count") or result.payload.get("total_sources") or 0
-            took = result.payload.get("search_time", "?")
-            self._set_status(f"Done. mode={mode} sources={count} time={took}s")
-        except Exception as exc:
-            self._set_status(f"Error: {exc}")
-            report_log.write(Text(str(exc), style="bold red"))
-        finally:
-            self._running = False
-            spinner_task.cancel()
+    if mode == "analyze":
+        base_reports = payload.get("agent_reports", [])
+        merges = payload.get("merge_reports", [])
+        lines = [
+            "# Final Answer",
+            "",
+            f"Synthesized from {len(base_reports)} analyze agents and {len(merges)} contradiction reports.",
+            "",
+            "## Consensus and Contradictions",
+        ]
 
-    async def _spinner(self, mode: str) -> None:
-        states = ["Searching", "Fetching pages", "Thinking", "Finalizing"]
-        if mode in {"skim", "analyze", "research"}:
-            states = ["Searching", "Thinking", "Thinking", "Finalizing"]
-        idx = 0
-        while True:
-            self._set_status(f"{states[idx % len(states)]} ({mode}) ...")
-            idx += 1
-            await asyncio.sleep(0.45)
-
-    async def _stream_payload(self, payload: dict[str, Any], report_log: RichLog, sources_log: RichLog) -> None:
-        report = payload.get("report") or payload.get("final_report")
-        if report:
-            chunk = []
-            for ch in report:
-                chunk.append(ch)
-                if len(chunk) >= 24 or ch == "\n":
-                    report_log.write("".join(chunk))
-                    chunk.clear()
-                    await asyncio.sleep(0.01)
-            if chunk:
-                report_log.write("".join(chunk))
+        if merges:
+            for item in merges:
+                label = item.get("label", "Merge Agent")
+                goal = item.get("goal", "")
+                signals = _extract_signal_lines(item.get("report", ""), max_lines=2)
+                header = f"- {label}"
+                if goal:
+                    header += f" ({goal})"
+                lines.append(header)
+                for point in signals:
+                    lines.append(f"  - {point}")
         else:
-            for source in payload.get("sources", []):
-                report_log.write(f"- {source.get('title', 'Untitled')}\n  {source.get('url', '')}")
-                await asyncio.sleep(0.02)
+            final = (payload.get("report") or "").strip()
+            if final:
+                lines.extend(_extract_signal_lines(final, max_lines=8))
+            else:
+                lines.append("- No contradiction reports were returned.")
 
-        for line in _source_lines(payload):
-            sources_log.write(line)
+        lines.extend(
+            [
+                "",
+                "## What To Do Next",
+                "- Use this summary for your decision baseline.",
+                "- Inspect raw merge reports below for full nuance and citation depth.",
+                "",
+                "## Raw Merge Reports",
+            ]
+        )
+        return "\n".join(lines).strip()
 
-    async def action_save_report(self) -> None:
-        if not self._last_payload:
-            self._set_status("Nothing to save yet.")
-            return
-        base = self._last_query.strip().replace(" ", "-")[:48] or "report"
-        path = Path.cwd() / f"{base}-{self._last_mode}.md"
-        path.write_text(markdown_from_result(self._last_query, self._last_mode, self._last_payload), encoding="utf-8")
-        self._set_status(f"Saved: {path.name}")
+    return _render_report_text(mode, payload)
+
+
+def _render_report_text(mode: str, payload: dict[str, Any]) -> str:
+    if mode == "skim":
+        reports = payload.get("skim_reports", [])
+        if not reports:
+            return (payload.get("report") or "").strip()
+        blocks = []
+        for item in reports:
+            agent = item.get("agent", "?")
+            query = item.get("query", "")
+            text = (item.get("report", "") or "").strip()
+            blocks.append(f"## Skim Agent {agent}\nQuery: {query}\n\n{text}")
+        return "\n\n".join(blocks).strip()
+
+    if mode == "research":
+        synthesis = payload.get("synthesis_reports", [])
+        if not synthesis:
+            return payload.get("final_report", "No synthesis reports returned.")
+        blocks = []
+        for item in synthesis:
+            group = item.get("group", "?")
+            queries = ", ".join(item.get("queries", []))
+            report = (item.get("report", "") or "").strip()
+            head = f"## Synthesis Block {group}"
+            if queries:
+                head += f"\nSub-queries: {queries}"
+            blocks.append(f"{head}\n\n{report}")
+        return "\n\n".join(blocks).strip()
+
+    if mode == "analyze":
+        base = (payload.get("report") or "").strip()
+        merges = payload.get("merge_reports", [])
+        if not merges:
+            return base
+        parts = [base, "", "## Contradiction Merge Reports"] if base else ["## Contradiction Merge Reports"]
+        for item in merges:
+            label = item.get("label", "Merge Agent")
+            goal = item.get("goal", "")
+            text = (item.get("report", "") or "").strip()
+            parts.append(f"### {label}")
+            if goal:
+                parts.append(f"Goal: {goal}")
+            parts.append(text)
+            parts.append("")
+        return "\n".join(parts).strip()
+
+    return (payload.get("report") or payload.get("final_report") or "").strip()
+
+
+def _render_result_console(console: Console, mode: str, payload: dict[str, Any]) -> None:
+    if mode in {"skim", "research", "analyze"}:
+        raw = _render_report_text(mode, payload)
+        if raw:
+            console.print(Panel(raw, title="Raw Reports", border_style="cyan"))
+
+    summary = _tui_consumer_summary(mode, payload)
+    if summary:
+        console.print(Panel(summary, title="Final Answer", border_style="green"))
+
+    details = _detail_lines(mode, payload)
+    if details:
+        table = Table(title="Details", show_header=False)
+        table.add_column("Key", style="yellow")
+        for line in details:
+            table.add_row(line)
+        console.print(table)
+
+
+async def run_tui(args: argparse.Namespace) -> int:
+    console = Console()
+    session = PromptSession()
+    mode = "peek"
+    last_query = ""
+    last_payload: dict[str, Any] = {}
+    last_mode = mode
+
+    console.print("[bold]ExpressIndex[/bold] simple TUI")
+    console.print("Commands: :mode <peek|skim|analyze|research>, :save [path], :status, :help, :quit")
+
+    while True:
+        prompt = f"[{mode}] query> "
+        with patch_stdout():
+            text = await session.prompt_async(prompt)
+        text = text.strip()
+        if not text:
+            continue
+
+        if text.startswith(":"):
+            parts = text[1:].split(maxsplit=1)
+            cmd = parts[0].lower()
+            arg = parts[1] if len(parts) > 1 else ""
+
+            if cmd in {"q", "quit", "exit"}:
+                return 0
+            if cmd == "help":
+                console.print("Use normal text to run query in current mode.")
+                console.print(":mode skim | :mode analyze | :mode research | :mode peek")
+                console.print(":save report.md  (or :save for auto filename)")
+                console.print(":status to check agent pool")
+                continue
+            if cmd == "mode":
+                candidate = arg.strip().lower()
+                if candidate in MODES:
+                    mode = candidate
+                    console.print(f"Mode set to [bold]{mode}[/bold]")
+                else:
+                    console.print(f"Invalid mode: {candidate}")
+                continue
+            if cmd == "save":
+                if not last_payload:
+                    console.print("Nothing to save yet.")
+                    continue
+                path = arg.strip()
+                if not path:
+                    base = last_query.strip().replace(" ", "-")[:48] or "report"
+                    path = f"{base}-{last_mode}.md"
+                Path(path).write_text(markdown_from_result(last_query, last_mode, last_payload), encoding="utf-8")
+                console.print(f"Saved markdown: {path}")
+                continue
+            if cmd == "status":
+                try:
+                    status = await call_agent_status(args.mcp_url)
+                    max_concurrent = int(status.get("max_concurrent", 0) or 0)
+                    available = int(status.get("available", 0) or 0)
+                    active = max(0, max_concurrent - available)
+                    console.print(f"Agents active: {active}/{max_concurrent} (available={available})")
+                except Exception as exc:
+                    console.print(f"agent_status failed: {exc}")
+                continue
+
+            console.print(f"Unknown command: {cmd}")
+            continue
+
+        query = text
+        console.print(f"Running [bold]{mode}[/bold]...", style="cyan")
+        try:
+            result = await call_mcp_tool(mode=mode, query=query, mcp_url=args.mcp_url)
+        except Exception as exc:
+            console.print(Panel(str(exc), title="Error", border_style="red"))
+            continue
+
+        last_query = query
+        last_mode = mode
+        last_payload = result.payload
+
+        _render_result_console(console, mode, result.payload)
+        count = result.payload.get("sources_count") or result.payload.get("total_sources") or 0
+        took = result.payload.get("search_time", "?")
+        console.print(f"Done. mode={mode} sources={count} time={took}s", style="green")
 
 
 def parse_args() -> argparse.Namespace:
@@ -290,7 +511,7 @@ async def run_direct(args: argparse.Namespace) -> int:
         max_content_chars=args.max_content_chars,
     )
     payload = result.payload
-    report = payload.get("report") or payload.get("final_report")
+    report = _tui_consumer_summary(args.mode, payload) or payload.get("report") or payload.get("final_report")
     if report:
         print(report)
     else:
@@ -305,8 +526,9 @@ async def run_direct(args: argparse.Namespace) -> int:
 def main() -> None:
     args = parse_args()
     if args.tui:
-        app = ExpressIndexTUI(mcp_url=args.mcp_url)
-        app.run()
+        raise_code = asyncio.run(run_tui(args))
+        if raise_code:
+            raise SystemExit(raise_code)
         return
     raise_code = asyncio.run(run_direct(args))
     if raise_code:

@@ -10,7 +10,7 @@ readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
   "aiohttp>=3.9.0",
-  "textual>=0.83.0",
+  "prompt_toolkit>=3.0.43",
   "rich>=13.7.0",
 ]
 

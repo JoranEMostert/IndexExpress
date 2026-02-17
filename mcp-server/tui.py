@@ -59,7 +59,7 @@ def sanitize_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
     for key in ("report", "final_report", "agent_a_report", "agent_b_report"):
         if isinstance(cleaned.get(key), str):
             cleaned[key] = strip_think_tags(cleaned[key])
-    for list_key in ("cluster_reports", "synthesis_reports", "merge_reports"):
+    for list_key in ("cluster_reports", "synthesis_reports", "merge_reports", "skim_reports"):
         rows = cleaned.get(list_key)
         if isinstance(rows, list):
             patched = []

@@ -20,7 +20,7 @@ Operational guide for coding agents in this repository.
 ## 3) Python and Dependencies
 
 - Python target: `>=3.11`.
-- Root dependencies: `aiohttp`, `textual`, `rich`.
+- Root dependencies: `aiohttp`, `prompt_toolkit`, `rich`.
 - Server dependencies: `aiohttp`, `pyyaml` (`mcp-server/requirements.txt`).
 - CLI entrypoint: `expressindex = expressindex_cli.main:main`.
 

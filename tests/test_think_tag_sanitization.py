@@ -45,6 +45,9 @@ def test_cli_payload_sanitizes_top_level_and_clusters():
         "merge_reports": [
             {"agent": 1, "report": "<think>z</think>Merged"},
         ],
+        "skim_reports": [
+            {"agent": 1, "report": "<think>a</think>Skimmed"},
+        ],
     }
 
     cleaned = _sanitize_payload(payload)
@@ -55,3 +58,4 @@ def test_cli_payload_sanitizes_top_level_and_clusters():
     assert cleaned["cluster_reports"][1]["report"] == "Already clean"
     assert cleaned["synthesis_reports"][0]["report"] == "Synthesis"
     assert cleaned["merge_reports"][0]["report"] == "Merged"
+    assert cleaned["skim_reports"][0]["report"] == "Skimmed"
