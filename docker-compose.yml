@@ -1,0 +1,63 @@
+services:
+  searxng:
+    image: searxng/searxng:latest
+    container_name: expressindex-searxng
+    ports:
+      - "8888:8080"
+    environment:
+      - SEARXNG_BASE_URL=http://localhost:8888/
+      - SEARXNG_SECRET=${SEARXNG_SECRET:-changeme123}
+      - SEARXNG_DEFAULT_LANG=en
+      - SEARXNG_INSTANCE_NAME=expressindex-search
+    volumes:
+      - ./searxng/settings.yml:/etc/searxng/settings.yml:ro
+    networks:
+      - mcp-network
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/healthz')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  mcp-server:
+    build:
+      context: ./mcp-server
+      dockerfile: Dockerfile
+    container_name: expressindex-mcp-server
+    ports:
+      - "8000:8000"
+    environment:
+      - SEARXNG_URL=http://searxng:8080
+      - LLM_API_URL=${LLM_API_URL:-http://host.docker.internal:1234/v1}
+      - LLM_API_KEY=${LLM_API_KEY:-}
+      - LLM_MODEL_ID=${LLM_MODEL_ID:-}
+      - LLM_TIMEOUT=${LLM_TIMEOUT:-0}
+      - LLM_MAX_PARALLEL=${LLM_MAX_PARALLEL:-4}
+      - MAX_CONCURRENT_AGENTS=${MAX_CONCURRENT_AGENTS:-7}
+      - PEEK_MAX_URLS=${PEEK_MAX_URLS:-5}
+      - SKIM_MAX_URLS=${SKIM_MAX_URLS:-15}
+      - SKIM_AGENT_COUNT=${SKIM_AGENT_COUNT:-1}
+      - ANALYZE_SOURCES_PER_AGENT=${ANALYZE_SOURCES_PER_AGENT:-12}
+      - ANALYZE_AGENT_COUNT=${ANALYZE_AGENT_COUNT:-2}
+      - ANALYZE_CONTRADICTION_AGENTS=${ANALYZE_CONTRADICTION_AGENTS:-0}
+      - RESEARCH_MAX_SUB_QUERIES=${RESEARCH_MAX_SUB_QUERIES:-}
+      - RESEARCH_SOURCES_PER_SUB_QUERY=${RESEARCH_SOURCES_PER_SUB_QUERY:-8}
+      - SEARXNG_TIMEOUT=${SEARXNG_TIMEOUT:-0}
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+    volumes:
+      - ./mcp-server:/app
+      - mcp-data:/app/data
+    depends_on:
+      searxng:
+        condition: service_healthy
+    networks:
+      - mcp-network
+    stdin_open: true
+    tty: true
+
+volumes:
+  mcp-data:
+
+networks:
+  mcp-network:
+    driver: bridge

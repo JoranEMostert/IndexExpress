@@ -1,0 +1,23 @@
+llm_api_url: http://host.docker.internal:1234/v1
+llm_api_key: ""
+llm_model_id: local-model
+llm_timeout: 0
+llm_max_parallel: 4
+
+searxng_url: ${SEARXNG_URL}
+searxng_timeout: 0
+
+max_concurrent_agents: 7
+agent_timeout: 60
+peek_max_urls: 5
+skim_max_urls: 15
+skim_agent_count: 1
+analyze_sources_per_agent: 12
+analyze_agent_count: 2
+analyze_contradiction_agents: 0
+research_max_sub_queries: 6
+research_sources_per_sub_query: 8
+
+mcp_host: 0.0.0.0
+mcp_port: 8000
+log_level: INFO
