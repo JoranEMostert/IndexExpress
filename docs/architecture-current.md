@@ -66,7 +66,7 @@ This document maps how the repository behaves today (pre-simplification).
 
 ## CLI Rendering Paths
 
-- Text output uses `_consumer_summary()` first, then fallback fields.
+- Text output uses `_render_report_text()` and fallback fields.
 - JSON output prints payload as-is (post-sanitization).
 - Markdown output uses `markdown_from_result()`.
 - Status and metrics are fetched from HTTP endpoints (`/health`, `/ready`, `/metrics`) and rendered separately.

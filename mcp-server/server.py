@@ -14,7 +14,7 @@ from typing import Any, Dict
 from aiohttp import web
 
 from compat import resolve_tool_name
-from config import CONFIG, list_llm_models
+from config import CONFIG
 from contracts import SCHEMA_VERSION
 from errors import JSONRPC_INVALID_PARAMS, ERROR_TYPE_VALIDATION
 from logging_utils import configure_logging
@@ -29,10 +29,6 @@ from utils.sanitize import strip_think_tags
 from validation import validate_query_tool_args, validate_fetch_url_args
 configure_logging(CONFIG.get("log_level", "INFO"), CONFIG.get("log_format", "text"))
 logger = logging.getLogger("expressindex-mcp")
-
-
-def _strip_think_tags(text: str) -> str:
-    return strip_think_tags(text)
 
 
 class MCPRequestHandler:
@@ -140,8 +136,6 @@ class MCPRequestHandler:
                 if 'error' in tool_result:
                     status = 'error'
                 return tool_result
-            elif method == 'resources/list':
-                return await self._handle_resources_list()
             elif method == 'health':
                 return await self._handle_health()
             elif method == 'ready':
@@ -187,161 +181,84 @@ class MCPRequestHandler:
     
     async def _handle_tools_list(self) -> Dict:
         """List available tools."""
+        query_prop = {"query": {"type": "string", "description": "Query"}}
         return {
-            'tools': [
+            "tools": [
                 {
-                    'name': 'peek',
-                    'description': 'Consensus-calibrated retrieval primitive for high-quality source candidates.',
-                    'inputSchema': {
-                        'type': 'object',
-                        'properties': {
-                            'query': {
-                                'type': 'string',
-                                'description': 'Search query'
-                            },
-                            'max_results': {
-                                'type': 'integer',
-                                'description': 'Maximum number of results (default: 5)',
-                                'default': 5
-                            },
-                            'fetch_content': {
-                                'type': 'boolean',
-                                'description': 'Fetch markdown-ish page content for each URL (default: true)',
-                                'default': True
-                            },
-                            'max_content_chars': {
-                                'type': 'integer',
-                                'description': 'Max fetched characters per source (default: 4000)',
-                                'default': 4000
-                            }
+                    "name": "peek",
+                    "description": "Retrieve ranked sources.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            **query_prop,
+                            "max_results": {"type": "integer", "default": 5},
+                            "fetch_content": {"type": "boolean", "default": True},
+                            "max_content_chars": {"type": "integer", "default": 4000},
                         },
-                        'required': ['query']
-                    }
+                        "required": ["query"],
+                    },
                 },
                 {
-                    'name': 'skim',
-                    'description': 'Citation-first distillation pack with claims and keyed evidence objects.',
-                    'inputSchema': {
-                        'type': 'object',
-                        'properties': {
-                            'query': {
-                                'type': 'string',
-                                'description': 'Search query'
-                            },
-                            'max_results': {
-                                'type': 'integer',
-                                'description': 'Maximum number of sources (default: 15)',
-                                'default': 15
-                            }
+                    "name": "skim",
+                    "description": "Generate citation-first summary.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {**query_prop, "max_results": {"type": "integer", "default": 15}},
+                        "required": ["query"],
+                    },
+                },
+                {
+                    "name": "analyze",
+                    "description": "Compare options with research fallback.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            **query_prop,
+                            "options": {"type": "array", "items": {"type": "string"}},
                         },
-                        'required': ['query']
-                    }
+                        "required": ["query"],
+                    },
                 },
                 {
-                    'name': 'analyze',
-                    'description': 'Comparative option adjudication with automatic research fallback.',
-                    'inputSchema': {
-                        'type': 'object',
-                        'properties': {
-                            'query': {
-                                'type': 'string',
-                                'description': 'Analysis query'
-                            },
-                            'options': {
-                                'type': 'array',
-                                'description': 'Optional explicit options to compare (2-5 preferred).',
-                                'items': {'type': 'string'}
-                            }
+                    "name": "research",
+                    "description": "Deep iterative research synthesis.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {**query_prop, "num_sub_queries": {"type": "integer", "default": 6}},
+                        "required": ["query"],
+                    },
+                },
+                {
+                    "name": "quicksearch",
+                    "description": "Deprecated alias for skim.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {**query_prop, "max_results": {"type": "integer", "default": 15}},
+                        "required": ["query"],
+                    },
+                },
+                {
+                    "name": "deepresearch",
+                    "description": "Deprecated alias for research.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {**query_prop, "num_sub_queries": {"type": "integer", "default": 6}},
+                        "required": ["query"],
+                    },
+                },
+                {"name": "agent_status", "description": "Get agent pool status", "inputSchema": {"type": "object", "properties": {}}},
+                {
+                    "name": "fetch_url",
+                    "description": "Fetch markdown-ish URL content.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "url": {"type": "string", "description": "Fully-qualified URL"},
+                            "max_chars": {"type": "integer", "default": 4000},
                         },
-                        'required': ['query']
-                    }
+                        "required": ["url"],
+                    },
                 },
-                {
-                    'name': 'research',
-                    'description': 'Iterative planner-reviewer DAG for deep, budget-aware evidence coverage.',
-                    'inputSchema': {
-                        'type': 'object',
-                        'properties': {
-                            'query': {
-                                'type': 'string',
-                                'description': 'Research query'
-                            },
-                            'num_sub_queries': {
-                                'type': 'integer',
-                                'description': 'Number of sub-queries to generate (default: 6)',
-                                'default': 6
-                            }
-                        },
-                        'required': ['query']
-                    }
-                },
-                {
-                    'name': 'quicksearch',
-                    'description': 'Deprecated alias for skim.',
-                    'inputSchema': {
-                        'type': 'object',
-                        'properties': {
-                            'query': {'type': 'string', 'description': 'Search query'},
-                            'max_results': {'type': 'integer', 'default': 15}
-                        },
-                        'required': ['query']
-                    }
-                },
-                {
-                    'name': 'deepresearch',
-                    'description': 'Deprecated alias for research.',
-                    'inputSchema': {
-                        'type': 'object',
-                        'properties': {
-                            'query': {'type': 'string', 'description': 'Research query'},
-                            'num_sub_queries': {'type': 'integer', 'default': 6}
-                        },
-                        'required': ['query']
-                    }
-                },
-                {
-                    'name': 'search_engines',
-                    'description': 'List available SearXNG search engines',
-                    'inputSchema': {
-                        'type': 'object',
-                        'properties': {}
-                    }
-                },
-                {
-                    'name': 'agent_status',
-                    'description': 'Get status of DeepSearch agent pool',
-                    'inputSchema': {
-                        'type': 'object',
-                        'properties': {}
-                    }
-                },
-                {
-                    'name': 'list_models',
-                    'description': 'List available LLM models from the configured API endpoint',
-                    'inputSchema': {
-                        'type': 'object',
-                        'properties': {}
-                    }
-                },
-                {
-                    'name': 'fetch_url',
-                    'description': 'Fetch markdown-ish content for a specific URL (debug/inspection helper).',
-                    'inputSchema': {
-                        'type': 'object',
-                        'properties': {
-                            'url': {
-                                'type': 'string',
-                                'description': 'Fully-qualified URL to fetch'
-                            },
-                            'max_chars': {
-                                'type': 'integer',
-                                'description': 'Maximum number of returned characters (default: 4000)',
-                                'default': 4000
-                            }
-                        },
-                        'required': ['url']
-                    }
-                }
             ]
         }
     
@@ -418,7 +335,7 @@ class MCPRequestHandler:
                     max_results=arguments.get('max_results')
                     ),
                 )
-                safe_answer = _strip_think_tags(result.final_answer)
+                safe_answer = strip_think_tags(result.final_answer)
                 record_tool('ok')
                 return self._text_content({
                     'query': result.query,
@@ -455,7 +372,7 @@ class MCPRequestHandler:
                         'route_reason': result.route_reason,
                         'analysis_type': result.analysis_type,
                         'options_compared': result.options_compared,
-                        'final_synthesis': _strip_think_tags(routed.final_synthesis),
+                        'final_synthesis': strip_think_tags(routed.final_synthesis),
                         'evidence_graph': routed.evidence_graph,
                         'coverage_report': routed.coverage_report,
                         'open_questions': routed.open_questions,
@@ -480,7 +397,7 @@ class MCPRequestHandler:
                     'consensus_claims': result.consensus_claims,
                     'disputed_claims': result.disputed_claims,
                     'decision_matrix': result.decision_matrix,
-                    'recommended_position': _strip_think_tags(result.recommended_position),
+                    'recommended_position': strip_think_tags(result.recommended_position),
                     'sensitivity_factors': result.sensitivity_factors,
                     'key_evidence': result.key_evidence,
                     'sources': result.sources,
@@ -498,7 +415,7 @@ class MCPRequestHandler:
                 record_tool('ok')
                 return self._text_content({
                     'query': result.query,
-                    'final_synthesis': _strip_think_tags(result.final_synthesis),
+                    'final_synthesis': strip_think_tags(result.final_synthesis),
                     'evidence_graph': result.evidence_graph,
                     'coverage_report': result.coverage_report,
                     'open_questions': result.open_questions,
@@ -508,24 +425,10 @@ class MCPRequestHandler:
                     '_meta': result.meta,
                 })
                 
-            elif resolved_tool_name == 'search_engines':
-                record_tool('ok')
-                return self._text_content(
-                    {'message': 'Available engines: google, bing, duckduckgo, wikipedia, youtube, and 240+ more via SearXNG'}
-                )
-                
             elif resolved_tool_name == 'agent_status':
                 status = self.deepresearch.get_pool_status()
                 record_tool('ok')
                 return self._text_content(status)
-                
-            elif resolved_tool_name == 'list_models':
-                models = await list_llm_models(
-                    CONFIG['llm_api_url'],
-                    CONFIG.get('llm_api_key')
-                )
-                record_tool('ok')
-                return self._text_content({'models': models, 'api_url': CONFIG['llm_api_url']})
 
             elif resolved_tool_name == 'fetch_url':
                 url = arguments.get('url', '').strip()
@@ -543,28 +446,6 @@ class MCPRequestHandler:
             logger.error("Tool error: %s", e, exc_info=True)
             record_tool('error', error_type)
             return self._error_payload(code, message, error_type)
-    
-    async def _handle_resources_list(self) -> Dict:
-        """List available resources."""
-        return {
-            'resources': [
-                {
-                    'uri': 'expressindex://health',
-                    'name': 'ExpressIndex Health',
-                    'description': 'Health status of ExpressIndex backend services'
-                },
-                {
-                    'uri': 'config://current',
-                    'name': 'Current Configuration',
-                    'description': 'Current MCP server configuration'
-                },
-                {
-                    'uri': 'expressindex://metrics',
-                    'name': 'ExpressIndex Metrics',
-                    'description': 'Aggregated request/tool counters and latency summaries'
-                }
-            ]
-        }
     
     async def _handle_health(self) -> Dict:
         """Handle health check."""

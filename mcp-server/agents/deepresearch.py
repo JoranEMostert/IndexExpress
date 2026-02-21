@@ -1322,66 +1322,6 @@ class DeepSearchOrchestrator:
         ]
         return self._ensure_sub_query_count(query, fallback, target)
 
-    @staticmethod
-    def _group_clusters(cluster_reports: list[dict[str, Any]]) -> list[list[dict[str, Any]]]:
-        """Group cluster reports by sub-agent count, targeting groups of 3.
-
-        Examples:
-        - 12 clusters -> 4 groups of 3
-        - 11 clusters -> 3 groups of 3 and 1 group of 2
-        - avoids singleton tail groups by rebalancing (..., 3, 1) -> (..., 2, 2)
-        """
-        n = len(cluster_reports)
-        if n <= 3:
-            return [cluster_reports]
-
-        sizes: list[int] = []
-        remaining = n
-        while remaining > 0:
-            if remaining == 4:
-                sizes.extend([2, 2])
-                remaining = 0
-                break
-            if remaining == 2:
-                sizes.append(2)
-                remaining = 0
-                break
-            if remaining == 1:
-                if sizes:
-                    sizes[-1] -= 1
-                    sizes.append(2)
-                else:
-                    sizes.append(1)
-                remaining = 0
-                break
-            sizes.append(3)
-            remaining -= 3
-
-        groups: list[list[dict[str, Any]]] = []
-        cursor = 0
-        for size in sizes:
-            groups.append(cluster_reports[cursor : cursor + size])
-            cursor += size
-        return groups
-
-    @staticmethod
-    def _stitch_synthesis_reports(query: str, synthesis_reports: list[dict[str, Any]]) -> str:
-        if not synthesis_reports:
-            return "No synthesis reports were generated."
-
-        lines: list[str] = ["Report", "", f"Query: {query}", ""]
-        for item in synthesis_reports:
-            group = item.get("group", "?")
-            queries = item.get("queries", [])
-            report = (item.get("report", "") or "").strip()
-            title = f"Synthesis Block {group}"
-            if queries:
-                title += f" ({', '.join(queries)})"
-            lines.append(f"## {title}")
-            lines.append(report or "No report content.")
-            lines.append("")
-        return "\n".join(lines).strip()
-
     def get_pool_status(self) -> dict[str, Any]:
         return {
             "max_concurrent": self.max_concurrent,

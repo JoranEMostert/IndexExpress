@@ -1,7 +1,6 @@
 import argparse
 import asyncio
 import json
-import re
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
@@ -191,7 +190,7 @@ def _render_metrics_text(metrics_payload: dict[str, Any]) -> str:
 def markdown_from_result(query: str, mode: str, payload: dict[str, Any]) -> str:
     lines = [f"# ExpressIndex {mode.title()} Report", "", f"Query: {query}", ""]
     report = (
-        _consumer_summary(mode, payload)
+        _render_report_text(mode, payload)
         or payload.get("final_answer")
         or payload.get("recommended_position")
         or payload.get("final_synthesis")
@@ -220,222 +219,6 @@ def markdown_from_result(query: str, mode: str, payload: dict[str, Any]) -> str:
     elif payload.get("search_time") is not None:
         lines.extend(["", f"Search time: {payload['search_time']}s"])
     return "\n".join(lines)
-
-
-def _extract_signal_lines(text: str, max_lines: int = 4) -> list[str]:
-    lines: list[str] = []
-    for raw in (text or "").splitlines():
-        line = raw.strip()
-        if not line:
-            continue
-        lowered = line.lower()
-        if lowered in {"report", "sources", "executive summary", "core findings", "final conclusions"}:
-            continue
-        if line.startswith("#"):
-            continue
-        if lowered.startswith("sources"):
-            continue
-        lines.append(line)
-        if len(lines) >= max_lines:
-            break
-    return lines
-
-
-def _has_open_questions_section(text: str) -> bool:
-    return bool(re.search(r"(?im)^##\s+open questions\s*$", text or ""))
-
-
-def _consumer_summary(mode: str, payload: dict[str, Any]) -> str:
-    """Terminal summary synthesis for multi-report payloads."""
-    if mode == "peek":
-        sources = payload.get("sources", [])
-        if not isinstance(sources, list) or not sources:
-            return "No sources returned."
-        lines = [
-            "# Peek Result",
-            "",
-            "## Top Sources",
-        ]
-        for src in sources[:6]:
-            lines.append(f"- {src.get('source_id', 'src')} {src.get('url', '')}")
-        return "\n".join(lines)
-
-    if mode == "skim":
-        if payload.get("final_answer"):
-            lines = [
-                "# Skim Final Answer",
-                "",
-                payload.get("final_answer", "").strip(),
-            ]
-            uncertainties = payload.get("uncertainties", [])
-            if uncertainties:
-                lines.extend(["", "## Uncertainties"])
-                for item in uncertainties[:5]:
-                    lines.append(f"- {item}")
-            return "\n".join(lines).strip()
-        reports = payload.get("skim_reports", [])
-        if not reports:
-            return payload.get("report", "No skim reports returned.")
-        lines = [
-            "# Final Answer",
-            "",
-            f"Synthesized from {len(reports)} skim reports.",
-            "",
-            "## Highlights Across Skim Agents",
-        ]
-        for item in reports:
-            agent = item.get("agent", "?")
-            query = item.get("query", "")
-            points = _extract_signal_lines(item.get("report", ""), max_lines=2)
-            lines.append(f"- Agent {agent} ({query})")
-            for point in points:
-                lines.append(f"  - {point}")
-        lines.extend(["", "## Raw Skim Reports"])
-        return "\n".join(lines).strip()
-
-    if mode == "research":
-        if payload.get("final_synthesis"):
-            final_synthesis = payload.get("final_synthesis", "").strip()
-            lines = [
-                "# Research Final Synthesis",
-                "",
-                final_synthesis,
-            ]
-            open_questions = payload.get("open_questions", [])
-            if open_questions and not _has_open_questions_section(final_synthesis):
-                lines.extend(["", "## Open Questions"])
-                for item in open_questions[:5]:
-                    lines.append(f"- {item}")
-            return "\n".join(lines).strip()
-        blocks = payload.get("synthesis_reports", [])
-        if not blocks:
-            return payload.get("final_report", "No synthesis reports were returned.")
-
-        lines = [
-            "# Final Answer",
-            "",
-            f"Synthesized from {len(blocks)} research report blocks.",
-            "",
-            "## Key Findings Across Blocks",
-        ]
-        for item in blocks:
-            group = item.get("group", "?")
-            queries = ", ".join(item.get("queries", []))
-            signals = _extract_signal_lines(item.get("report", ""), max_lines=2)
-            title = f"- Block {group}"
-            if queries:
-                title += f" ({queries})"
-            lines.append(title)
-            for point in signals:
-                lines.append(f"  - {point}")
-
-        lines.extend(
-            [
-                "",
-                "## What To Do With These Reports",
-                "- Use this final answer for decision-making.",
-                "- Use the raw synthesis blocks below to inspect disagreements and citations.",
-                "",
-                "## Raw Synthesis Blocks",
-            ]
-        )
-        return "\n".join(lines).strip()
-
-    if mode == "analyze":
-        if payload.get("executed_mode") == "research":
-            route_reason = payload.get("route_reason", "insufficient_comparative_signal")
-            base = _consumer_summary("research", payload)
-            return (
-                "# Analyze Routed to Research\n\n"
-                f"Reason: {route_reason}\n\n"
-                f"{base}"
-            ).strip()
-
-        if payload.get("recommended_position"):
-            decision_matrix = payload.get("decision_matrix")
-            fact_style = isinstance(decision_matrix, list) and not decision_matrix
-            lines = [
-                "# Analyze Findings" if fact_style else "# Analyze Recommendation",
-                "",
-                payload.get("recommended_position", "").strip(),
-            ]
-            options_compared = payload.get("options_compared", [])
-            if options_compared:
-                lines.append("")
-                lines.append("Options compared: " + ", ".join(str(item) for item in options_compared[:5]))
-            if payload.get("recommended_option"):
-                lines.append(f"Recommended option: {payload.get('recommended_option')} ({payload.get('confidence', 'unknown')})")
-            why_not = payload.get("why_not", [])
-            if why_not:
-                lines.extend(["", "## Tradeoffs"])
-                for item in why_not[:3]:
-                    lines.append(f"- {item}")
-
-            if fact_style:
-                lines.extend(
-                    [
-                        "",
-                        f"Fact claims reviewed: {len(payload.get('consensus_claims', []))}",
-                    ]
-                )
-                disputed_count = len(payload.get("disputed_claims", []))
-                if disputed_count:
-                    lines.append(f"Disputed claims: {disputed_count}")
-            else:
-                lines.extend(
-                    [
-                        "",
-                        f"Consensus claims: {len(payload.get('consensus_claims', []))}",
-                        f"Disputed claims: {len(payload.get('disputed_claims', []))}",
-                    ]
-                )
-            factors = payload.get("sensitivity_factors", [])
-            if factors:
-                lines.extend(["", "## Sensitivity Factors"])
-                for item in factors[:5]:
-                    lines.append(f"- {item}")
-            return "\n".join(lines).strip()
-        base_reports = payload.get("agent_reports", [])
-        merges = payload.get("merge_reports", [])
-        lines = [
-            "# Final Answer",
-            "",
-            f"Synthesized from {len(base_reports)} analyze agents and {len(merges)} contradiction reports.",
-            "",
-            "## Consensus and Contradictions",
-        ]
-
-        if merges:
-            for item in merges:
-                label = item.get("label", "Merge Agent")
-                goal = item.get("goal", "")
-                signals = _extract_signal_lines(item.get("report", ""), max_lines=2)
-                header = f"- {label}"
-                if goal:
-                    header += f" ({goal})"
-                lines.append(header)
-                for point in signals:
-                    lines.append(f"  - {point}")
-        else:
-            final = (payload.get("report") or "").strip()
-            if final:
-                lines.extend(_extract_signal_lines(final, max_lines=8))
-            else:
-                lines.append("- No contradiction reports were returned.")
-
-        lines.extend(
-            [
-                "",
-                "## What To Do Next",
-                "- Use this summary for your decision baseline.",
-                "- Inspect raw merge reports below for full nuance and citation depth.",
-                "",
-                "## Raw Merge Reports",
-            ]
-        )
-        return "\n".join(lines).strip()
-
-    return _render_report_text(mode, payload)
 
 
 def _render_report_text(mode: str, payload: dict[str, Any]) -> str:
@@ -641,7 +424,7 @@ async def run_direct(args: argparse.Namespace) -> int:
         print(markdown_from_result(args.query, args.mode, payload))
     else:
         report = (
-            _consumer_summary(args.mode, payload)
+            _render_report_text(args.mode, payload)
             or payload.get("final_answer")
             or payload.get("recommended_position")
             or payload.get("final_synthesis")

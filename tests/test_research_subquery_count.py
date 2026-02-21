@@ -55,31 +55,6 @@ def test_generate_sub_queries_fact_mode_uses_targeted_fallback_templates():
     assert out[5] == "slug facts ecological role and predators"
 
 
-def test_group_clusters_targets_three_per_synthesis():
-    clusters = [{"query": f"q{i}", "report": "r"} for i in range(1, 7)]
-    grouped = DeepSearchOrchestrator._group_clusters(clusters)
-    assert len(grouped) == 2
-    assert [len(g) for g in grouped] == [3, 3]
-
-
-def test_group_clusters_handles_eleven_as_three_three_three_two():
-    clusters = [{"query": f"q{i}", "report": "r"} for i in range(1, 12)]
-    grouped = DeepSearchOrchestrator._group_clusters(clusters)
-    assert [len(g) for g in grouped] == [3, 3, 3, 2]
-
-
-def test_stitch_synthesis_reports_builds_final_report_text():
-    synthesis_reports = [
-        {"group": 1, "queries": ["q1", "q2"], "report": "Block one findings."},
-        {"group": 2, "queries": ["q3"], "report": "Block two findings."},
-    ]
-    stitched = DeepSearchOrchestrator._stitch_synthesis_reports("topic", synthesis_reports)
-    assert "Report" in stitched
-    assert "Query: topic" in stitched
-    assert "Synthesis Block 1 (q1, q2)" in stitched
-    assert "Block two findings." in stitched
-
-
 def test_compose_final_synthesis_includes_contradictions_trace_and_open_questions():
     consensus_claims = [
         {
