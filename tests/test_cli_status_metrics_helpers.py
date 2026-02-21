@@ -1,10 +1,10 @@
 from expressindex_cli.main import (
+    _consumer_summary,
     _http_base_from_mcp,
     _parse_options_arg,
     _render_metrics_text,
     _render_report_text,
     _render_status_text,
-    _tui_consumer_summary,
 )
 
 
@@ -69,10 +69,10 @@ def test_render_report_text_handles_analyze_routed_to_research():
     assert "Key synthesis line." in text
 
 
-def test_tui_consumer_summary_avoids_duplicate_open_questions_section():
+def test_consumer_summary_avoids_duplicate_open_questions_section():
     payload = {
         "final_synthesis": "Report\n\n## Open Questions\n- Existing one",
         "open_questions": ["Existing one", "New one"],
     }
-    text = _tui_consumer_summary("research", payload)
+    text = _consumer_summary("research", payload)
     assert text.count("## Open Questions") == 1

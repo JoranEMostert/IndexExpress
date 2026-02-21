@@ -1,4 +1,3 @@
-import json
 import logging
 import re
 from dataclasses import dataclass
@@ -6,6 +5,7 @@ from typing import Any, Dict, List
 
 from search.llm_client import LLMClient
 from utils.sanitize import strip_think_tags
+from workflow_primitives import normalize_url
 
 logger = logging.getLogger("reporting")
 
@@ -14,13 +14,6 @@ logger = logging.getLogger("reporting")
 class ReportOutput:
     report: str
     sources: List[Dict[str, str]]
-
-
-def normalize_url(url: str) -> str:
-    cleaned = (url or "").strip().lower()
-    cleaned = re.sub(r"^https?://", "", cleaned)
-    cleaned = cleaned.rstrip("/")
-    return cleaned
 
 
 def dedupe_sources(results: List[Dict[str, Any]], limit: int) -> List[Dict[str, Any]]:
@@ -329,7 +322,6 @@ class ReportGenerator:
         lines = ["Report", "", f"Summary for '{query}':"]
         for idx, src in enumerate(sources[:8], start=1):
             title = src.get("title", "Untitled")
-            url = src.get("url", "")
             snippet = re.sub(r"\s+", " ", (src.get("content") or "").strip())[:200]
             if snippet:
                 lines.append(f"- {title}: {snippet} ({idx})")

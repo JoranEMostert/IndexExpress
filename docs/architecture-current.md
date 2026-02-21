@@ -5,7 +5,7 @@ This document maps how the repository behaves today (pre-simplification).
 ## Runtime Entry Points
 
 - MCP server: `mcp-server/server.py`
-- CLI/TUI: `expressindex_cli/main.py`
+- CLI: `expressindex_cli/main.py`
 - Core sanitization package: `expressindex_core/sanitize.py`
 
 ## High-Level Runtime Flow
@@ -17,7 +17,7 @@ This document maps how the repository behaves today (pre-simplification).
 5. Agents call search and LLM clients in `mcp-server/search/`.
 6. Agents construct payloads and return results to server.
 7. Server wraps payload in MCP `content[0].text` JSON and returns to CLI.
-8. CLI sanitizes and renders output as text/json/markdown or TUI panels.
+8. CLI sanitizes and renders output as text/json/markdown.
 
 ## MCP Server Internal Flow (`mcp-server/server.py`)
 
@@ -66,7 +66,7 @@ This document maps how the repository behaves today (pre-simplification).
 
 ## CLI Rendering Paths
 
-- Text output uses `_tui_consumer_summary()` first, then fallback fields.
+- Text output uses `_consumer_summary()` first, then fallback fields.
 - JSON output prints payload as-is (post-sanitization).
 - Markdown output uses `markdown_from_result()`.
 - Status and metrics are fetched from HTTP endpoints (`/health`, `/ready`, `/metrics`) and rendered separately.
@@ -80,5 +80,5 @@ This document maps how the repository behaves today (pre-simplification).
 ## Current Coupling Hotspots
 
 - `mcp-server/server.py` combines transport, validation, dispatch, aliasing, and endpoint wiring.
-- `expressindex_cli/main.py` combines args, transport, rendering, and TUI loop.
+- `expressindex_cli/main.py` combines args, transport, and rendering.
 - `mcp-server/workflow_primitives.py` mixes URL utilities, ranking, evidence, and claim logic.

@@ -161,11 +161,11 @@ expressindex/
 
 - [ ] Split transport calls into `cli/client.py`.
 - [ ] Split argument parsing into `cli/args.py`.
-- [ ] Split TUI command loop into `cli/tui.py`.
+- [x] Remove interactive TUI surface and keep single direct CLI path. - DONE (OpenCode)
 - [ ] Split report rendering into `cli/render_reports.py`.
 - [ ] Split status/metrics rendering into `cli/render_status.py`.
 - [ ] Split markdown export into `cli/export_markdown.py`.
-- [ ] Reduce duplicated logic between `_tui_consumer_summary` and `_render_report_text`.
+- [ ] Reduce duplicated logic between `_consumer_summary` and `_render_report_text`.
 - [ ] Define one rendering contract per mode.
 - [ ] Add snapshot tests for text output per mode.
 - [ ] Add snapshot tests for markdown output per mode.
@@ -233,7 +233,7 @@ expressindex/
 - [ ] Verify largest files are below target thresholds.
 - [ ] Run full lint, compile, and test suite.
 - [ ] Run manual smoke checks for all four modes and status/metrics.
-- [ ] Confirm CLI/TUI output quality and readability.
+- [ ] Confirm CLI output quality and readability.
 - [ ] Confirm docs reflect current behavior exactly.
 - [ ] Tag simplification milestone and summarize wins/remaining debt.
 

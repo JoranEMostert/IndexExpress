@@ -8,7 +8,7 @@ Guidance for coding agents working in this repository.
 - Primary language: Python 3.11+
 - Main runtime surfaces:
   - MCP server in `mcp-server/`
-  - CLI/TUI in `expressindex_cli/`
+  - CLI in `expressindex_cli/`
   - Tests in `tests/`
 
 ## Quick Project Map
@@ -21,7 +21,7 @@ Guidance for coding agents working in this repository.
 - `mcp-server/search/`: SearXNG + LLM async clients
 - `mcp-server/workflow_primitives.py`: ranking/evidence/claim graph primitives
 - `mcp-server/reporting.py`: report writing/merging/citation repair
-- `expressindex_cli/main.py`: user-facing CLI and interactive TUI
+- `expressindex_cli/main.py`: user-facing CLI
 - `tests/`: pytest suite for sanitization and orchestration logic
 
 ## Environment Setup
@@ -92,12 +92,6 @@ pip install ruff mypy
 
 ```bash
 python mcp-server/server.py
-```
-
-- Launch TUI:
-
-```bash
-expressindex --tui
 ```
 
 - Direct CLI mode examples:

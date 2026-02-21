@@ -5,13 +5,11 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "expressindex"
 version = "0.1.0"
-description = "ExpressIndex CLI and TUI for local MCP research tiers"
+description = "ExpressIndex CLI for local MCP research tiers"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
   "aiohttp>=3.9.0",
-  "prompt_toolkit>=3.0.43",
-  "rich>=13.7.0",
 ]
 
 [project.scripts]

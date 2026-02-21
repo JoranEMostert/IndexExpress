@@ -10,11 +10,6 @@ from urllib.parse import urlsplit
 
 import aiohttp
 from expressindex_core.sanitize import sanitize_payload
-from prompt_toolkit import PromptSession
-from prompt_toolkit.patch_stdout import patch_stdout
-from rich.console import Console
-from rich.panel import Panel
-from rich.table import Table
 
 
 MCP_URL_DEFAULT = "http://localhost:8000/mcp"
@@ -196,7 +191,7 @@ def _render_metrics_text(metrics_payload: dict[str, Any]) -> str:
 def markdown_from_result(query: str, mode: str, payload: dict[str, Any]) -> str:
     lines = [f"# ExpressIndex {mode.title()} Report", "", f"Query: {query}", ""]
     report = (
-        _tui_consumer_summary(mode, payload)
+        _consumer_summary(mode, payload)
         or payload.get("final_answer")
         or payload.get("recommended_position")
         or payload.get("final_synthesis")
@@ -360,8 +355,8 @@ def _has_open_questions_section(text: str) -> bool:
     return bool(re.search(r"(?im)^##\s+open questions\s*$", text or ""))
 
 
-def _tui_consumer_summary(mode: str, payload: dict[str, Any]) -> str:
-    """TUI-only synthesis that mimics an MCP consumer reading many reports."""
+def _consumer_summary(mode: str, payload: dict[str, Any]) -> str:
+    """Terminal summary synthesis for multi-report payloads."""
     if mode == "peek":
         sources = payload.get("sources", [])
         if not isinstance(sources, list) or not sources:
@@ -459,7 +454,7 @@ def _tui_consumer_summary(mode: str, payload: dict[str, Any]) -> str:
     if mode == "analyze":
         if payload.get("executed_mode") == "research":
             route_reason = payload.get("route_reason", "insufficient_comparative_signal")
-            base = _tui_consumer_summary("research", payload)
+            base = _consumer_summary("research", payload)
             return (
                 "# Analyze Routed to Research\n\n"
                 f"Reason: {route_reason}\n\n"
@@ -671,117 +666,10 @@ def _render_report_text(mode: str, payload: dict[str, Any]) -> str:
     ).strip()
 
 
-def _render_result_console(console: Console, mode: str, payload: dict[str, Any]) -> None:
-    if mode in {"skim", "research", "analyze"}:
-        raw = _render_report_text(mode, payload)
-        if raw:
-            console.print(Panel(raw, title="Raw Reports", border_style="cyan"))
-
-    summary = _tui_consumer_summary(mode, payload)
-    if summary:
-        console.print(Panel(summary, title="Final Answer", border_style="green"))
-
-    details = _detail_lines(mode, payload)
-    if details:
-        table = Table(title="Details", show_header=False)
-        table.add_column("Key", style="yellow")
-        for line in details:
-            table.add_row(line)
-        console.print(table)
-
-
-async def run_tui(args: argparse.Namespace) -> int:
-    console = Console()
-    session = PromptSession()
-    mode = "peek"
-    last_query = ""
-    last_payload: dict[str, Any] = {}
-    last_mode = mode
-
-    console.print("[bold]ExpressIndex[/bold] simple TUI")
-    console.print("Commands: :mode <peek|skim|analyze|research>, :save [path], :status, :help, :quit")
-
-    while True:
-        prompt = f"[{mode}] query> "
-        with patch_stdout():
-            text = await session.prompt_async(prompt)
-        text = text.strip()
-        if not text:
-            continue
-
-        if text.startswith(":"):
-            parts = text[1:].split(maxsplit=1)
-            cmd = parts[0].lower()
-            arg = parts[1] if len(parts) > 1 else ""
-
-            if cmd in {"q", "quit", "exit"}:
-                return 0
-            if cmd == "help":
-                console.print("Use normal text to run query in current mode.")
-                console.print(":mode skim | :mode analyze | :mode research | :mode peek")
-                console.print(":save report.md  (or :save for auto filename)")
-                console.print(":status to check agent pool")
-                continue
-            if cmd == "mode":
-                candidate = arg.strip().lower()
-                if candidate in QUERY_MODES:
-                    mode = candidate
-                    console.print(f"Mode set to [bold]{mode}[/bold]")
-                else:
-                    console.print(f"Invalid mode: {candidate}")
-                continue
-            if cmd == "save":
-                if not last_payload:
-                    console.print("Nothing to save yet.")
-                    continue
-                path = arg.strip()
-                if not path:
-                    base = last_query.strip().replace(" ", "-")[:48] or "report"
-                    path = f"{base}-{last_mode}.md"
-                Path(path).write_text(markdown_from_result(last_query, last_mode, last_payload), encoding="utf-8")
-                console.print(f"Saved markdown: {path}")
-                continue
-            if cmd == "status":
-                try:
-                    status = await call_agent_status(args.mcp_url)
-                    max_concurrent = int(status.get("max_concurrent", 0) or 0)
-                    available = int(status.get("available", 0) or 0)
-                    active = max(0, max_concurrent - available)
-                    console.print(f"Agents active: {active}/{max_concurrent} (available={available})")
-                except Exception as exc:
-                    console.print(f"agent_status failed: {exc}")
-                continue
-
-            console.print(f"Unknown command: {cmd}")
-            continue
-
-        query = text
-        console.print(f"Running [bold]{mode}[/bold]...", style="cyan")
-        try:
-            result = await call_mcp_tool(mode=mode, query=query, mcp_url=args.mcp_url)
-        except Exception as exc:
-            console.print(Panel(str(exc), title="Error", border_style="red"))
-            continue
-
-        last_query = query
-        last_mode = mode
-        last_payload = result.payload
-
-        _render_result_console(console, mode, result.payload)
-        count = result.payload.get("sources_count") or result.payload.get("total_sources")
-        if count is None:
-            count = len(result.payload.get("sources", []))
-        meta = result.payload.get("_meta", {})
-        took = meta.get("compute_ms", "?") if isinstance(meta, dict) else result.payload.get("search_time", "?")
-        suffix = "ms" if isinstance(meta, dict) and meta.get("compute_ms") is not None else "s"
-        console.print(f"Done. mode={mode} sources={count} time={took}{suffix}", style="green")
-
-
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(prog="expressindex", description="ExpressIndex MCP search client")
     parser.add_argument("mode", nargs="?", choices=MODES, help="Run one mode directly")
     parser.add_argument("query", nargs="?", help="Query text for direct mode")
-    parser.add_argument("--tui", action="store_true", help="Launch interactive TUI")
     parser.add_argument("--mcp-url", default=MCP_URL_DEFAULT, help="MCP endpoint URL")
     parser.add_argument("--max-results", type=int, default=None, help="Result cap for peek/skim")
     parser.add_argument("--num-sub-queries", type=int, default=None, help="Sub-query count for research")
@@ -863,7 +751,7 @@ async def run_direct(args: argparse.Namespace) -> int:
         print(markdown_from_result(args.query, args.mode, payload))
     else:
         report = (
-            _tui_consumer_summary(args.mode, payload)
+            _consumer_summary(args.mode, payload)
             or payload.get("final_answer")
             or payload.get("recommended_position")
             or payload.get("final_synthesis")
@@ -883,11 +771,6 @@ async def run_direct(args: argparse.Namespace) -> int:
 
 def main() -> None:
     args = parse_args()
-    if args.tui:
-        raise_code = asyncio.run(run_tui(args))
-        if raise_code:
-            raise SystemExit(raise_code)
-        return
     raise_code = asyncio.run(run_direct(args))
     if raise_code:
         raise SystemExit(raise_code)

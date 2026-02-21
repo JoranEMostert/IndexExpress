@@ -28,7 +28,7 @@ Privacy-first web research with tiered retrieval/report modes, source-cited outp
 ## Architecture
 
 ```text
-Client (MCP or TUI)
+Client (MCP or CLI)
     |
     v
 MCP Server (server.py)
@@ -101,7 +101,7 @@ Example call:
 {"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"skim","arguments":{"query":"fun facts about slugs","max_results":15}}}
 ```
 
-## Terminal UI (User-Facing)
+## Terminal CLI
 
 Install the local CLI:
 
@@ -109,13 +109,7 @@ Install the local CLI:
 pip install -e .
 ```
 
-Launch TUI:
-
-```bash
-expressindex --tui
-```
-
-Run direct command mode:
+Run command mode:
 
 ```bash
 expressindex peek "what is searxng"
@@ -161,12 +155,12 @@ expressindex skim "fun facts" --output json
 expressindex skim "fun facts" --output markdown
 ```
 
-UI goals:
+CLI goals:
 
-- clear progress prompts
+- clear output
 - friendly error messages
 - no MCP protocol noise in normal output
-- simple command-loop UX with mock MCP-consumer summaries for multi-report modes
+- concise consumer summaries for multi-report modes
 
 ## Report Contract
 
@@ -250,5 +244,5 @@ Legacy alias still supported:
 - Tier agents: `mcp-server/agents/quicksearch.py`, `mcp-server/agents/deepresearch.py`
 - Reporting engine: `mcp-server/reporting.py`
 - Search/LLM clients: `mcp-server/search/searxng_client.py`, `mcp-server/search/llm_client.py`
-- ExpressIndex CLI/TUI: `expressindex_cli/main.py`
+- ExpressIndex CLI: `expressindex_cli/main.py`
 - Skill profile: `.agents/skills/searxng-mcp-research/SKILL.md`
