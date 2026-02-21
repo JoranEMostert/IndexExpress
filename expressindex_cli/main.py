@@ -1,6 +1,7 @@
 import argparse
 import asyncio
 import json
+import re
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
@@ -26,6 +27,13 @@ def _sanitize_payload(payload: dict[str, Any]) -> dict[str, Any]:
     return sanitize_payload(payload)
 
 
+def _parse_options_arg(raw: Optional[str]) -> Optional[list[str]]:
+    if not raw:
+        return None
+    options = [item.strip() for item in str(raw).split(",") if item.strip()]
+    return options or None
+
+
 @dataclass
 class QueryResult:
     mode: str
@@ -40,6 +48,7 @@ async def call_mcp_tool(
     num_sub_queries: Optional[int] = None,
     fetch_content: Optional[bool] = None,
     max_content_chars: Optional[int] = None,
+    options: Optional[list[str]] = None,
 ) -> QueryResult:
     arguments: dict[str, Any] = {"query": query}
     if mode in {"peek", "skim"} and max_results is not None:
@@ -50,6 +59,8 @@ async def call_mcp_tool(
             arguments["max_content_chars"] = max_content_chars
     if mode == "research" and num_sub_queries is not None:
         arguments["num_sub_queries"] = num_sub_queries
+    if mode == "analyze" and options:
+        arguments["options"] = options
 
     body = {
         "jsonrpc": "2.0",
@@ -279,14 +290,28 @@ def _detail_lines(mode: str, payload: dict[str, Any]) -> list[str]:
         return lines
 
     if mode == "analyze":
+        if payload.get("executed_mode") == "research":
+            graph = payload.get("evidence_graph", {})
+            lines = [
+                f"requested_mode: {payload.get('requested_mode', 'analyze')}",
+                f"executed_mode: {payload.get('executed_mode', 'research')}",
+                f"route_reason: {payload.get('route_reason', 'unknown')}",
+                f"graph_nodes: {len(graph.get('nodes', [])) if isinstance(graph, dict) else 0}",
+                f"sources: {len(payload.get('sources', []))}",
+            ]
+            return lines
+
         decision_matrix = payload.get("decision_matrix")
         if isinstance(decision_matrix, list) and decision_matrix:
             lines = [
+                f"options_compared: {len(payload.get('options_compared', []))}",
                 f"consensus_claims: {len(payload.get('consensus_claims', []))}",
                 f"disputed_claims: {len(payload.get('disputed_claims', []))}",
                 f"decision_dimensions: {len(decision_matrix)}",
                 f"sources: {len(payload.get('sources', []))}",
             ]
+            if payload.get("recommended_option"):
+                lines.append(f"recommended_option: {payload.get('recommended_option')} ({payload.get('confidence', 'unknown')})")
             for factor in payload.get("sensitivity_factors", [])[:3]:
                 lines.append(f"- sensitivity: {factor}")
             return lines
@@ -329,6 +354,10 @@ def _extract_signal_lines(text: str, max_lines: int = 4) -> list[str]:
         if len(lines) >= max_lines:
             break
     return lines
+
+
+def _has_open_questions_section(text: str) -> bool:
+    return bool(re.search(r"(?im)^##\s+open questions\s*$", text or ""))
 
 
 def _tui_consumer_summary(mode: str, payload: dict[str, Any]) -> str:
@@ -381,13 +410,14 @@ def _tui_consumer_summary(mode: str, payload: dict[str, Any]) -> str:
 
     if mode == "research":
         if payload.get("final_synthesis"):
+            final_synthesis = payload.get("final_synthesis", "").strip()
             lines = [
                 "# Research Final Synthesis",
                 "",
-                payload.get("final_synthesis", "").strip(),
+                final_synthesis,
             ]
             open_questions = payload.get("open_questions", [])
-            if open_questions:
+            if open_questions and not _has_open_questions_section(final_synthesis):
                 lines.extend(["", "## Open Questions"])
                 for item in open_questions[:5]:
                     lines.append(f"- {item}")
@@ -427,6 +457,15 @@ def _tui_consumer_summary(mode: str, payload: dict[str, Any]) -> str:
         return "\n".join(lines).strip()
 
     if mode == "analyze":
+        if payload.get("executed_mode") == "research":
+            route_reason = payload.get("route_reason", "insufficient_comparative_signal")
+            base = _tui_consumer_summary("research", payload)
+            return (
+                "# Analyze Routed to Research\n\n"
+                f"Reason: {route_reason}\n\n"
+                f"{base}"
+            ).strip()
+
         if payload.get("recommended_position"):
             decision_matrix = payload.get("decision_matrix")
             fact_style = isinstance(decision_matrix, list) and not decision_matrix
@@ -435,6 +474,18 @@ def _tui_consumer_summary(mode: str, payload: dict[str, Any]) -> str:
                 "",
                 payload.get("recommended_position", "").strip(),
             ]
+            options_compared = payload.get("options_compared", [])
+            if options_compared:
+                lines.append("")
+                lines.append("Options compared: " + ", ".join(str(item) for item in options_compared[:5]))
+            if payload.get("recommended_option"):
+                lines.append(f"Recommended option: {payload.get('recommended_option')} ({payload.get('confidence', 'unknown')})")
+            why_not = payload.get("why_not", [])
+            if why_not:
+                lines.extend(["", "## Tradeoffs"])
+                for item in why_not[:3]:
+                    lines.append(f"- {item}")
+
             if fact_style:
                 lines.extend(
                     [
@@ -550,6 +601,11 @@ def _render_report_text(mode: str, payload: dict[str, Any]) -> str:
         return "\n\n".join(blocks).strip()
 
     if mode == "analyze":
+        if payload.get("executed_mode") == "research":
+            reason = payload.get("route_reason", "insufficient_comparative_signal")
+            research_text = _render_report_text("research", payload)
+            return f"Analyze routed to research: {reason}\n\n{research_text}".strip()
+
         if payload.get("recommended_position"):
             decision_matrix = payload.get("decision_matrix")
             if isinstance(decision_matrix, list) and not decision_matrix:
@@ -566,11 +622,20 @@ def _render_report_text(mode: str, payload: dict[str, Any]) -> str:
                         lines.append(f"- {item}")
                 return "\n".join(lines).strip()
 
-            lines = [
-                payload.get("recommended_position", "").strip(),
-                "",
-                "## Decision Matrix",
-            ]
+            lines = [payload.get("recommended_position", "").strip(), ""]
+            options_compared = payload.get("options_compared", [])
+            if options_compared:
+                lines.append("Options compared: " + ", ".join(str(item) for item in options_compared[:5]))
+            if payload.get("recommended_option"):
+                lines.append(
+                    f"Recommended option: {payload.get('recommended_option')} ({payload.get('confidence', 'unknown')})"
+                )
+            why_not = payload.get("why_not", [])
+            if why_not:
+                lines.extend(["", "## Tradeoffs"])
+                for item in why_not[:3]:
+                    lines.append(f"- {item}")
+            lines.extend(["", "## Decision Matrix"])
             for row in decision_matrix or []:
                 lines.append(f"### {row.get('dimension', 'Dimension')}")
                 for option in row.get("options", []):
@@ -721,6 +786,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-results", type=int, default=None, help="Result cap for peek/skim")
     parser.add_argument("--num-sub-queries", type=int, default=None, help="Sub-query count for research")
     parser.add_argument(
+        "--options",
+        default=None,
+        help="For analyze mode, comma-separated options to compare (example: 'python,node,go').",
+    )
+    parser.add_argument(
         "--fetch-content",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -784,6 +854,7 @@ async def run_direct(args: argparse.Namespace) -> int:
         num_sub_queries=args.num_sub_queries,
         fetch_content=args.fetch_content,
         max_content_chars=args.max_content_chars,
+        options=_parse_options_arg(args.options),
     )
     payload = result.payload
     if output == "json":

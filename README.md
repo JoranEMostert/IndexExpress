@@ -11,7 +11,7 @@ Privacy-first web research with tiered retrieval/report modes, source-cited outp
 
 - `peek`: pure link-discovery primitive returning ranked `sources`
 - `skim`: citation-first distillation returning `final_answer`, `claims`, `key_evidence`
-- `analyze`: fact-aware adjudication returning either cited findings (fact mode) or a decision matrix (comparative mode)
+- `analyze`: comparative adjudication for explicit alternatives, with automatic fallback to `research` when comparison input is insufficient
 - `research`: iterative planner-reviewer DAG returning `final_synthesis`, `evidence_graph`, and coverage status
 - Citation contract: evidence links by `source_id` / `evidence_id`
 - Output: optional markdown export for reports
@@ -22,7 +22,7 @@ Privacy-first web research with tiered retrieval/report modes, source-cited outp
 |---|---|---|---|---|
 | `peek` | Quick evidence frontier | Multi-intent retrieval + calibration | No | `sources` with rank metadata |
 | `skim` | Fast grounded answer | Parallel evidence collection | Claim/evidence distillation | `final_answer`, `claims`, `key_evidence` |
-| `analyze` | Resolve contradictions / score options | Adversarial evidence pass | Decision adjudication | `consensus_claims`, `disputed_claims`, `recommended_position`, optional `decision_matrix` |
+| `analyze` | Compare alternatives and recommend one | Adversarial evidence pass | Decision adjudication | comparator payload or routed `research` payload with routing metadata |
 | `research` | Exhaustive investigation | Iterative planner/reviewer loops | Graph synthesis | `evidence_graph`, `coverage_report`, `trace_log` |
 
 ## Architecture
@@ -121,6 +121,7 @@ Run direct command mode:
 expressindex peek "what is searxng"
 expressindex skim "fun facts about slugs" --save-md report.md
 expressindex analyze "best python web framework" --save-md compare.md
+expressindex analyze "python vs node.js for backend" --options "python,node.js"
 expressindex research "vacation plan to aruba" --num-sub-queries 6 --save-md aruba.md
 expressindex status
 expressindex metrics --json
@@ -132,7 +133,7 @@ All terminal activations (all search modes + URL fetch helper):
 # Search modes (CLI)
 expressindex peek "slug facts"
 expressindex skim "slug facts"
-expressindex analyze "slug facts"
+expressindex analyze "python vs node.js for backend" --options "python,node.js"
 expressindex research "slug facts" --num-sub-queries 6
 
 # URL fetch helper (MCP tool)
@@ -180,7 +181,7 @@ Mode-specific outputs:
 
 - `peek`: `query`, `sources`, `_meta`
 - `skim`: `final_answer`, `claims`, `uncertainties`
-- `analyze`: `query_mode`, `consensus_claims`, `disputed_claims`, `recommended_position`, `sensitivity_factors`, optional `decision_matrix`
+- `analyze`: `requested_mode`, `executed_mode`, `route_reason`, `options_compared`, `recommended_option`, `confidence`, `why_not`, `recommended_position`, `decision_matrix`
 - `research`: `final_synthesis`, `evidence_graph`, `coverage_report`, `open_questions`, `trace_log`
 
 ## Environment Variables

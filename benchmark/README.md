@@ -6,6 +6,7 @@ Simple benchmark runner for collecting repeatable mode-level performance and pay
 
 - Runs all four search modes in sequence: `peek`, `skim`, `analyze`, `research`
 - Captures latency, status, payload sizes, and key count fields per run
+- Captures routing metadata (`requested_mode`, `executed_mode`, `route_reason`) to track analyze-to-research handoffs
 - Writes three report formats into `benchmark/output_reports/`:
   - JSON (full raw benchmark data)
   - CSV (flat rows for quick spreadsheet/charting)

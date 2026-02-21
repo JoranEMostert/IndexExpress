@@ -249,13 +249,18 @@ class MCPRequestHandler:
                 },
                 {
                     'name': 'analyze',
-                    'description': 'Adversarial claim-graph adjudication with decision matrix output.',
+                    'description': 'Comparative option adjudication with automatic research fallback.',
                     'inputSchema': {
                         'type': 'object',
                         'properties': {
                             'query': {
                                 'type': 'string',
                                 'description': 'Analysis query'
+                            },
+                            'options': {
+                                'type': 'array',
+                                'description': 'Optional explicit options to compare (2-5 preferred).',
+                                'items': {'type': 'string'}
                             }
                         },
                         'required': ['query']
@@ -404,6 +409,19 @@ class MCPRequestHandler:
                     return self._error_payload(
                         -32602, 'Invalid params: num_sub_queries must be a positive integer', 'validation_error'
                     )
+
+            if resolved_tool_name == "analyze" and arguments.get("options") is not None:
+                options = arguments.get("options")
+                if not isinstance(options, list):
+                    record_tool('error', 'validation_error')
+                    return self._error_payload(-32602, 'Invalid params: options must be an array of strings', 'validation_error')
+                if len(options) > 8:
+                    record_tool('error', 'validation_error')
+                    return self._error_payload(-32602, 'Invalid params: options must contain at most 8 items', 'validation_error')
+                for option in options:
+                    if not isinstance(option, str) or not option.strip():
+                        record_tool('error', 'validation_error')
+                        return self._error_payload(-32602, 'Invalid params: each option must be a non-empty string', 'validation_error')
         
         logger.info(
             "Calling tool",
@@ -456,13 +474,49 @@ class MCPRequestHandler:
                 result = await self._run_with_timeout(
                     "analyze",
                     self.analyze.analyze(
-                    query=arguments['query']
+                    query=arguments['query'],
+                    options=arguments.get('options'),
                     ),
                 )
+
+                if result.route_reason:
+                    routed = await self._run_with_timeout(
+                        "research",
+                        self.deepresearch.search(
+                            query=arguments['query'],
+                            num_sub_queries=CONFIG.get('research_max_sub_queries', 6),
+                        ),
+                    )
+                    record_tool('ok')
+                    return self._text_content({
+                        'query': routed.query,
+                        'requested_mode': 'analyze',
+                        'executed_mode': 'research',
+                        'route_reason': result.route_reason,
+                        'analysis_type': result.analysis_type,
+                        'options_compared': result.options_compared,
+                        'final_synthesis': _strip_think_tags(routed.final_synthesis),
+                        'evidence_graph': routed.evidence_graph,
+                        'coverage_report': routed.coverage_report,
+                        'open_questions': routed.open_questions,
+                        'trace_log': routed.trace_log,
+                        'key_evidence': routed.key_evidence,
+                        'sources': routed.sources,
+                        '_meta': routed.meta,
+                    })
+
                 record_tool('ok')
                 return self._text_content({
                     'query': result.query,
                     'query_mode': result.query_mode,
+                    'requested_mode': result.requested_mode,
+                    'executed_mode': result.executed_mode,
+                    'route_reason': result.route_reason,
+                    'analysis_type': result.analysis_type,
+                    'options_compared': result.options_compared,
+                    'recommended_option': result.recommended_option,
+                    'confidence': result.confidence,
+                    'why_not': result.why_not,
                     'consensus_claims': result.consensus_claims,
                     'disputed_claims': result.disputed_claims,
                     'decision_matrix': result.decision_matrix,

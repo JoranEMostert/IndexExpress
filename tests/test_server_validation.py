@@ -28,3 +28,11 @@ def test_fetch_url_rejects_non_http_url():
     result = asyncio.run(_call_and_close({"name": "fetch_url", "arguments": {"url": "ftp://example.com"}}))
     assert result["error"]["code"] == -32602
     assert result["error"]["data"]["type"] == "validation_error"
+
+
+def test_analyze_rejects_invalid_options_entries():
+    result = asyncio.run(
+        _call_and_close({"name": "analyze", "arguments": {"query": "python vs node", "options": ["python", ""]}})
+    )
+    assert result["error"]["code"] == -32602
+    assert result["error"]["data"]["type"] == "validation_error"

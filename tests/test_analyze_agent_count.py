@@ -173,3 +173,42 @@ def test_sensitivity_factors_include_measurable_signals():
     assert factors
     assert any("disputed" in item.lower() for item in factors)
     assert any("trust < 0.65" in item for item in factors)
+
+
+def test_resolve_compare_options_prefers_explicit_then_query_inference():
+    explicit = AnalyzeOrchestrator._resolve_compare_options(
+        "python vs node for backend",
+        options=["Python", "Node.js"],
+    )
+    assert explicit == ["Python", "Node.js"]
+
+    inferred = AnalyzeOrchestrator._resolve_compare_options(
+        "python vs node for backend",
+        options=None,
+    )
+    assert len(inferred) >= 2
+    assert inferred[0].lower().startswith("python")
+
+
+def test_recommendation_details_extracts_best_option_and_confidence():
+    matrix = [
+        {
+            "dimension": "Evidence Coverage",
+            "options": [
+                {
+                    "option_name": "Python",
+                    "score": 82,
+                    "rationale": "More corroborated sources",
+                },
+                {
+                    "option_name": "Node.js",
+                    "score": 64,
+                    "rationale": "Less consistent evidence",
+                },
+            ],
+        }
+    ]
+    option, confidence, why_not = AnalyzeOrchestrator._recommendation_details(matrix)
+    assert option == "Python"
+    assert confidence in {"moderate", "high"}
+    assert why_not

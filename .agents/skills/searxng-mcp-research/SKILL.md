@@ -13,7 +13,7 @@ metadata:
 - Use the local ExpressIndex MCP server at `http://localhost:8000/mcp`.
 - Use `peek` for link discovery (`query`, `sources`, `_meta`), with optional page fetching during ranking.
 - Use `skim` for concise cited output (`final_answer`, `claims`, `key_evidence`, `sources`, `uncertainties`).
-- Use `analyze` for fact-aware adjudication (`recommended_position`, `sensitivity_factors`, and optional `decision_matrix`).
+- Use `analyze` for comparative adjudication with optional explicit `options`; if input is not comparative enough it auto-routes to `research` and returns routing metadata.
 - Use `research` for deep synthesis (`final_synthesis`, `evidence_graph`, `coverage_report`, `open_questions`, `trace_log`).
 - Use `fetch_url` to inspect the extracted markdown-ish content for a single URL.
 - Use `list_models` to inspect available model IDs from the configured OpenAI-compatible API.
@@ -36,7 +36,7 @@ Use this skill when a task needs web research through your self-hosted ExpressIn
 3. Pick mode:
     - URL-first quick scan: `tools/call` -> `peek`
     - Fast factual distillation: `tools/call` -> `skim`
-    - Mid-depth adjudication/recommendation: `tools/call` -> `analyze`
+    - Mid-depth comparative adjudication/recommendation: `tools/call` -> `analyze` (with optional `options`)
     - Comprehensive deep research: `tools/call` -> `research`
     - Single URL content inspection: `tools/call` -> `fetch_url`
 4. Optional diagnostics:
@@ -61,7 +61,7 @@ Use `POST http://localhost:8000/mcp` with `Content-Type: application/json`.
 ```
 
 ```json
-{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"analyze","arguments":{"query":"<topic>"}}}
+{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"analyze","arguments":{"query":"<topic>","options":["option a","option b"]}}}
 ```
 
 ```json
@@ -75,7 +75,7 @@ Use `POST http://localhost:8000/mcp` with `Content-Type: application/json`.
 ## Operating defaults
 
 - Start with `peek` for quick URL lookups and `skim` for most standard research tasks.
-- Use `analyze` when the user asks for comparison, contradictions, or reconciliation of viewpoints.
+- Use `analyze` when the user asks for explicit comparisons/alternatives; provide `options` when possible.
 - Use `research` when the user needs a deep, multi-angle report.
 - Use `fetch_url` when a specific URL needs extraction debugging or content validation.
 - For `research`, keep `num_sub_queries` aligned with available parallel agents.

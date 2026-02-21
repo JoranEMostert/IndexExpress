@@ -35,6 +35,12 @@ class ModeRunResult:
     disputed_count: int
     decision_dimensions: int
     open_questions_count: int
+    requested_mode: str
+    executed_mode: str
+    route_reason: str
+    analysis_type: str
+    options_count: int
+    confidence: str
     message_preview: str
     error: str
 
@@ -120,6 +126,12 @@ async def _call_mode(
             disputed_count=0,
             decision_dimensions=0,
             open_questions_count=0,
+            requested_mode=mode,
+            executed_mode=mode,
+            route_reason="",
+            analysis_type="",
+            options_count=0,
+            confidence="",
             message_preview="",
             error=str(exc),
         )
@@ -141,6 +153,12 @@ async def _call_mode(
             disputed_count=0,
             decision_dimensions=0,
             open_questions_count=0,
+            requested_mode=mode,
+            executed_mode=mode,
+            route_reason="",
+            analysis_type="",
+            options_count=0,
+            confidence="",
             message_preview="",
             error=raw[:300],
         )
@@ -164,6 +182,12 @@ async def _call_mode(
             disputed_count=0,
             decision_dimensions=0,
             open_questions_count=0,
+            requested_mode=mode,
+            executed_mode=mode,
+            route_reason="",
+            analysis_type="",
+            options_count=0,
+            confidence="",
             message_preview="",
             error=f"Invalid JSON envelope: {exc}",
         )
@@ -186,6 +210,12 @@ async def _call_mode(
             disputed_count=0,
             decision_dimensions=0,
             open_questions_count=0,
+            requested_mode=mode,
+            executed_mode=mode,
+            route_reason="",
+            analysis_type="",
+            options_count=0,
+            confidence="",
             message_preview="",
             error=message,
         )
@@ -214,6 +244,12 @@ async def _call_mode(
                 disputed_count=0,
                 decision_dimensions=0,
                 open_questions_count=0,
+                requested_mode=mode,
+                executed_mode=mode,
+                route_reason="",
+                analysis_type="",
+                options_count=0,
+                confidence="",
                 message_preview="",
                 error=f"Invalid tool payload JSON: {exc}",
             )
@@ -234,6 +270,12 @@ async def _call_mode(
         disputed_count=_safe_len(payload.get("disputed_claims")),
         decision_dimensions=_safe_len(payload.get("decision_matrix")),
         open_questions_count=_safe_len(payload.get("open_questions")),
+        requested_mode=str(payload.get("requested_mode", mode)),
+        executed_mode=str(payload.get("executed_mode", mode)),
+        route_reason=str(payload.get("route_reason", "")),
+        analysis_type=str(payload.get("analysis_type", "")),
+        options_count=_safe_len(payload.get("options_compared")),
+        confidence=str(payload.get("confidence", "")),
         message_preview=_message_preview(payload),
         error="",
     )
@@ -262,6 +304,9 @@ def _aggregate(results: list[ModeRunResult]) -> dict[str, Any]:
             "avg_sources": round(statistics.mean([item.sources_count for item in ok_rows]), 2)
             if ok_rows
             else None,
+            "routed": len(
+                [item for item in ok_rows if item.requested_mode == "analyze" and item.executed_mode == "research"]
+            ),
         }
     return summary
 
@@ -294,8 +339,8 @@ def _write_markdown(path: Path, summary: dict[str, Any], results: list[ModeRunRe
         "",
         "## Per-Mode Summary",
         "",
-        "| Mode | Runs | OK | Failed | Avg Latency (ms) | Min | Max | Avg Sources |",
-        "|---|---:|---:|---:|---:|---:|---:|---:|",
+        "| Mode | Runs | OK | Failed | Avg Latency (ms) | Min | Max | Avg Sources | Routed |",
+        "|---|---:|---:|---:|---:|---:|---:|---:|---:|",
     ]
 
     per_mode = summary.get("per_mode", {})
@@ -305,7 +350,7 @@ def _write_markdown(path: Path, summary: dict[str, Any], results: list[ModeRunRe
             "| "
             f"{mode} | {row.get('runs', 0)} | {row.get('ok', 0)} | {row.get('failed', 0)} | "
             f"{row.get('avg_latency_ms', '-') } | {row.get('min_latency_ms', '-') } | "
-            f"{row.get('max_latency_ms', '-') } | {row.get('avg_sources', '-') } |"
+            f"{row.get('max_latency_ms', '-') } | {row.get('avg_sources', '-') } | {row.get('routed', 0)} |"
         )
 
     lines.extend(
@@ -313,8 +358,8 @@ def _write_markdown(path: Path, summary: dict[str, Any], results: list[ModeRunRe
             "",
             "## Detailed Runs",
             "",
-            "| Run | Mode | OK | HTTP | Latency (ms) | Sources | Evidence | Claims | Consensus | Disputed | Notes |",
-            "|---:|---|---|---:|---:|---:|---:|---:|---:|---:|---|",
+            "| Run | Mode | Exec | OK | HTTP | Latency (ms) | Sources | Evidence | Claims | Consensus | Disputed | Notes |",
+            "|---:|---|---|---|---:|---:|---:|---:|---:|---:|---:|---|",
         ]
     )
 
@@ -323,7 +368,7 @@ def _write_markdown(path: Path, summary: dict[str, Any], results: list[ModeRunRe
         note = " ".join(note.split())[:120]
         lines.append(
             "| "
-            f"{item.run_index} | {item.mode} | {str(item.ok).lower()} | {item.http_status} | "
+            f"{item.run_index} | {item.mode} | {item.executed_mode} | {str(item.ok).lower()} | {item.http_status} | "
             f"{item.latency_ms} | {item.sources_count} | {item.evidence_count} | {item.claims_count} | "
             f"{item.consensus_count} | {item.disputed_count} | {note} |"
         )

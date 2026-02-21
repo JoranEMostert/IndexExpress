@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+import re
 import time
 from dataclasses import dataclass
 from typing import Any, Optional
@@ -31,6 +32,14 @@ logger = logging.getLogger("deepresearch")
 class AnalyzeResult:
     query: str
     query_mode: str
+    requested_mode: str
+    executed_mode: str
+    route_reason: str
+    analysis_type: str
+    options_compared: list[str]
+    recommended_option: str
+    confidence: str
+    why_not: list[str]
     consensus_claims: list[dict[str, Any]]
     disputed_claims: list[dict[str, Any]]
     decision_matrix: list[dict[str, Any]]
@@ -73,10 +82,61 @@ class AnalyzeOrchestrator:
         self.contradiction_agents = max(1, contradiction_agents or 2)
         self._llm_semaphore = asyncio.Semaphore(max(1, llm_parallel))
 
-    async def analyze(self, query: str) -> AnalyzeResult:
+    async def analyze(self, query: str, options: Optional[list[str]] = None) -> AnalyzeResult:
         started_at = time.perf_counter()
         intent = classify_query_intent(query)
         query_mode = classify_query_mode(query)
+        options_compared = self._resolve_compare_options(query, options)
+
+        if len(options_compared) < 2:
+            route_reason = "non_comparative_query"
+            payload = {
+                "query": query,
+                "query_mode": query_mode,
+                "requested_mode": "analyze",
+                "executed_mode": "analyze",
+                "route_reason": route_reason,
+                "analysis_type": "mode_mismatch",
+                "options_compared": options_compared,
+                "recommended_option": "",
+                "confidence": "low",
+                "why_not": [
+                    "Analyze requires at least two concrete options to compare.",
+                    "Route to research for broad evidence exploration.",
+                ],
+                "consensus_claims": [],
+                "disputed_claims": [],
+                "decision_matrix": [],
+                "recommended_position": "",
+                "sensitivity_factors": [
+                    "Query did not include clear comparison candidates for decision analysis."
+                ],
+                "sources": [],
+                "key_evidence": [],
+            }
+            payload["_meta"] = build_meta(started_at, payload)
+            return AnalyzeResult(
+                query=query,
+                query_mode=query_mode,
+                requested_mode="analyze",
+                executed_mode="analyze",
+                route_reason=route_reason,
+                analysis_type="mode_mismatch",
+                options_compared=options_compared,
+                recommended_option="",
+                confidence="low",
+                why_not=payload["why_not"],
+                consensus_claims=[],
+                disputed_claims=[],
+                decision_matrix=[],
+                recommended_position="",
+                sensitivity_factors=payload["sensitivity_factors"],
+                sources=[],
+                key_evidence=[],
+                meta=payload["_meta"],
+                search_time=time.perf_counter() - started_at,
+            )
+
         sub_queries = self._build_analyze_sub_queries(query, self.agent_count, query_mode=query_mode)
         logger.info("Analyze v2: query=%s sub_queries=%s", query, len(sub_queries))
 
@@ -115,30 +175,33 @@ class AnalyzeOrchestrator:
         claims = make_claim_primitives(evidence_rows, max_claims=max_claims)
         consensus_claims, disputed_claims = split_consensus_disputed(claims)
 
-        if query_mode == "fact":
-            decision_matrix: list[dict[str, Any]] = []
-            recommended_position = self._factual_position(
-                query,
-                consensus_claims,
-                disputed_claims,
-                evidence_rows,
-            )
-        else:
-            decision_matrix = self._build_decision_matrix(
-                consensus_claims,
-                disputed_claims,
-                source_primitives,
-            )
-            recommended_position = self._recommended_position(decision_matrix)
+        decision_matrix = self._build_decision_matrix(
+            consensus_claims,
+            disputed_claims,
+            source_primitives,
+            options=options_compared,
+            evidence_rows=evidence_rows,
+        )
+        recommended_position = self._recommended_position(decision_matrix)
+        recommended_option, confidence, why_not = self._recommendation_details(decision_matrix)
         sensitivity_factors = self._sensitivity_factors(
             consensus_claims,
             disputed_claims,
             source_primitives,
-            query_mode=query_mode,
+            query_mode="comparative",
         )
 
         payload = {
             "query": query,
+            "query_mode": "comparative",
+            "requested_mode": "analyze",
+            "executed_mode": "analyze",
+            "route_reason": "",
+            "analysis_type": "comparative",
+            "options_compared": options_compared,
+            "recommended_option": recommended_option,
+            "confidence": confidence,
+            "why_not": why_not,
             "consensus_claims": consensus_claims,
             "disputed_claims": disputed_claims,
             "decision_matrix": decision_matrix,
@@ -151,7 +214,15 @@ class AnalyzeOrchestrator:
 
         return AnalyzeResult(
             query=query,
-            query_mode=query_mode,
+            query_mode="comparative",
+            requested_mode="analyze",
+            executed_mode="analyze",
+            route_reason="",
+            analysis_type="comparative",
+            options_compared=options_compared,
+            recommended_option=recommended_option,
+            confidence=confidence,
+            why_not=why_not,
             consensus_claims=consensus_claims,
             disputed_claims=disputed_claims,
             decision_matrix=decision_matrix,
@@ -162,6 +233,130 @@ class AnalyzeOrchestrator:
             meta=payload["_meta"],
             search_time=time.perf_counter() - started_at,
         )
+
+    @staticmethod
+    def _resolve_compare_options(query: str, options: Optional[list[str]]) -> list[str]:
+        normalized: list[str] = []
+        seen: set[str] = set()
+
+        for row in options or []:
+            value = str(row or "").strip()
+            if not value:
+                continue
+            key = value.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            normalized.append(value)
+
+        if len(normalized) >= 2:
+            return normalized[:5]
+
+        inferred = AnalyzeOrchestrator._extract_options_from_query(query)
+        for option in inferred:
+            key = option.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            normalized.append(option)
+            if len(normalized) >= 5:
+                break
+
+        return normalized
+
+    @staticmethod
+    def _extract_options_from_query(query: str) -> list[str]:
+        raw = (query or "").strip().rstrip("?")
+        if not raw:
+            return []
+
+        if re.search(r"\s+vs\s+|\s+versus\s+", raw, flags=re.IGNORECASE):
+            parts = re.split(r"\s+(?:vs|versus)\s+", raw, flags=re.IGNORECASE)
+            cleaned = [AnalyzeOrchestrator._clean_option_label(item) for item in parts]
+            cleaned = [item for item in cleaned if item]
+            if len(cleaned) >= 2:
+                return cleaned[:5]
+
+        compare_match = re.search(r"compare\s+(.+?)\s+(?:and|vs|versus)\s+(.+)$", raw, flags=re.IGNORECASE)
+        if compare_match:
+            left = AnalyzeOrchestrator._clean_option_label(compare_match.group(1))
+            right = AnalyzeOrchestrator._clean_option_label(compare_match.group(2))
+            out = [item for item in [left, right] if item]
+            if len(out) >= 2:
+                return out
+
+        between_match = re.search(r"between\s+(.+?)\s+and\s+(.+)$", raw, flags=re.IGNORECASE)
+        if between_match:
+            left = AnalyzeOrchestrator._clean_option_label(between_match.group(1))
+            right = AnalyzeOrchestrator._clean_option_label(between_match.group(2))
+            out = [item for item in [left, right] if item]
+            if len(out) >= 2:
+                return out
+
+        return []
+
+    @staticmethod
+    def _clean_option_label(text: str) -> str:
+        value = (text or "").strip()
+        value = re.sub(r"^(compare|between|best|should i choose)\s+", "", value, flags=re.IGNORECASE)
+        value = re.sub(r"\b(for|in|on)\s+.+$", "", value, flags=re.IGNORECASE)
+        return value.strip(" ,.-")
+
+    @staticmethod
+    def _option_tokens(option_name: str) -> list[str]:
+        stopwords = {
+            "the",
+            "and",
+            "for",
+            "with",
+            "from",
+            "into",
+            "than",
+            "versus",
+            "compare",
+            "between",
+            "best",
+            "option",
+        }
+        tokens = re.findall(r"[a-z0-9]{3,}", (option_name or "").lower())
+        return [token for token in tokens if token not in stopwords][:6]
+
+    @staticmethod
+    def _text_mentions_option(text: str, option_name: str, option_tokens: list[str]) -> bool:
+        lowered = (text or "").lower()
+        if not lowered:
+            return False
+        if option_name.lower() in lowered:
+            return True
+        if not option_tokens:
+            return False
+        token_hits = sum(1 for token in option_tokens if token in lowered)
+        min_hits = 1 if len(option_tokens) <= 2 else 2
+        return token_hits >= min_hits
+
+    @staticmethod
+    def _recommendation_details(decision_matrix: list[dict[str, Any]]) -> tuple[str, str, list[str]]:
+        if not decision_matrix:
+            return "", "low", []
+        first_dimension = decision_matrix[0]
+        options = first_dimension.get("options", [])
+        if not options:
+            return "", "low", []
+        ranked = sorted(options, key=lambda row: row.get("score", 0), reverse=True)
+        best = ranked[0]
+        runner_up = ranked[1] if len(ranked) > 1 else None
+        margin = int(best.get("score", 0)) - int(runner_up.get("score", 0)) if runner_up else 0
+        confidence = "high" if int(best.get("score", 0)) >= 75 and margin >= 12 else "moderate"
+        if int(best.get("score", 0)) < 60:
+            confidence = "low"
+
+        why_not: list[str] = []
+        for alternative in ranked[1:3]:
+            rationale = (alternative.get("rationale", "") or "").strip().rstrip(".")
+            if rationale:
+                why_not.append(f"{alternative.get('option_name', 'Alternative')}: {rationale}.")
+
+        return str(best.get("option_name", "")), confidence, why_not
 
     @staticmethod
     def _factual_position(
@@ -194,7 +389,103 @@ class AnalyzeOrchestrator:
         consensus_claims: list[dict[str, Any]],
         disputed_claims: list[dict[str, Any]],
         sources: list[dict[str, Any]],
+        options: Optional[list[str]] = None,
+        evidence_rows: Optional[list[dict[str, Any]]] = None,
     ) -> list[dict[str, Any]]:
+        option_names = [item for item in (options or []) if str(item).strip()]
+        if len(option_names) >= 2 and isinstance(evidence_rows, list):
+            source_map = {
+                row.get("source_id", ""): float(row.get("domain_trust_score", 0.0))
+                for row in sources
+                if isinstance(row, dict)
+            }
+
+            evidence_strength_rows: list[dict[str, Any]] = []
+            trust_rows: list[dict[str, Any]] = []
+            risk_rows: list[dict[str, Any]] = []
+
+            for option_name in option_names:
+                tokens = AnalyzeOrchestrator._option_tokens(option_name)
+
+                matched_evidence = [
+                    row
+                    for row in evidence_rows
+                    if AnalyzeOrchestrator._text_mentions_option(
+                        row.get("exact_quote", ""), option_name, tokens
+                    )
+                ]
+                source_ids = {
+                    row.get("source_id", "")
+                    for row in matched_evidence
+                    if row.get("source_id", "")
+                }
+                trust_values = [source_map.get(source_id, 0.6) for source_id in source_ids]
+                avg_trust = (sum(trust_values) / len(trust_values)) if trust_values else 0.6
+
+                related_consensus_ids = [
+                    row.get("claim_id", "")
+                    for row in consensus_claims
+                    if AnalyzeOrchestrator._text_mentions_option(
+                        row.get("statement", ""), option_name, tokens
+                    )
+                ]
+                related_disputed_ids = [
+                    row.get("claim_id", "")
+                    for row in disputed_claims
+                    if AnalyzeOrchestrator._text_mentions_option(
+                        row.get("statement", ""), option_name, tokens
+                    )
+                ]
+
+                coverage_score = int(
+                    max(5, min(95, 20 + (len(matched_evidence) * 6) + (len(source_ids) * 7)))
+                )
+                trust_score = int(max(5, min(95, round(15 + (avg_trust * 75)))))
+                risk_score = int(
+                    max(
+                        5,
+                        min(
+                            95,
+                            round(86 - (len(related_disputed_ids) * 12) - (max(0, 2 - len(source_ids)) * 6)),
+                        ),
+                    )
+                )
+
+                evidence_strength_rows.append(
+                    {
+                        "option_name": option_name,
+                        "score": coverage_score,
+                        "rationale": (
+                            f"Matched {len(matched_evidence)} evidence items from {len(source_ids)} sources."
+                        ),
+                        "relevant_claim_ids": related_consensus_ids[:4] + related_disputed_ids[:2],
+                    }
+                )
+                trust_rows.append(
+                    {
+                        "option_name": option_name,
+                        "score": trust_score,
+                        "rationale": f"Average source trust for matched evidence is {avg_trust:.2f}.",
+                        "relevant_claim_ids": related_consensus_ids[:4],
+                    }
+                )
+                risk_rows.append(
+                    {
+                        "option_name": option_name,
+                        "score": risk_score,
+                        "rationale": (
+                            f"Detected {len(related_disputed_ids)} disputed claim links affecting this option."
+                        ),
+                        "relevant_claim_ids": related_disputed_ids[:5],
+                    }
+                )
+
+            return [
+                {"dimension": "Evidence Coverage", "options": evidence_strength_rows},
+                {"dimension": "Source Trust", "options": trust_rows},
+                {"dimension": "Contradiction Risk", "options": risk_rows},
+            ]
+
         consensus_n = len(consensus_claims)
         disputed_n = len(disputed_claims)
         total_claims = max(1, consensus_n + disputed_n)
