@@ -10,3 +10,7 @@ dist/
 build/
 *.egg-info/
 report.md
+benchmark/output_reports/*.json
+benchmark/output_reports/*.csv
+benchmark/output_reports/*.md
+!benchmark/output_reports/.gitkeep

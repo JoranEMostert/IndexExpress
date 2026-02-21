@@ -3,12 +3,26 @@ import json
 import logging
 import time
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
+from typing import Any, Optional
+from urllib.parse import urlparse
 
-from agents.quicksearch import QuickSearchSubAgent, SkimAgent, SkimResult
-from reporting import ReportGenerator, dedupe_sources, normalize_url
+from agents.quicksearch import QuickSearchSubAgent
+from reporting import dedupe_sources
 from search.llm_client import LLMClient
 from search.searxng_client import SearXNGClient
+from workflow_primitives import (
+    build_meta,
+    cited_bullet_summary,
+    classify_query_intent,
+    classify_query_mode,
+    make_claim_primitives,
+    make_edges_from_claims,
+    make_evidence_primitives,
+    make_source_primitives,
+    normalize_url,
+    rank_sources,
+    split_consensus_disputed,
+)
 
 logger = logging.getLogger("deepresearch")
 
@@ -16,29 +30,30 @@ logger = logging.getLogger("deepresearch")
 @dataclass
 class AnalyzeResult:
     query: str
-    report: str
-    report_a: str
-    report_b: str
-    sources_a: int
-    sources_b: int
-    agent_reports: List[Dict[str, Any]]
-    agent_count: int
-    merge_reports: List[Dict[str, Any]]
-    merge_agent_count: int
+    query_mode: str
+    consensus_claims: list[dict[str, Any]]
+    disputed_claims: list[dict[str, Any]]
+    decision_matrix: list[dict[str, Any]]
+    recommended_position: str
+    sensitivity_factors: list[str]
+    sources: list[dict[str, Any]]
+    key_evidence: list[dict[str, Any]]
+    meta: dict[str, Any]
     search_time: float
 
 
 @dataclass
 class DeepSearchResult:
     query: str
-    sub_queries: List[str]
-    cluster_reports: List[Dict[str, Any]]
-    synthesis_reports: List[Dict[str, Any]]
-    agent_runs: List[Dict[str, Any]]
-    final_report: str
-    total_sources: int
+    final_synthesis: str
+    evidence_graph: dict[str, Any]
+    coverage_report: dict[str, Any]
+    open_questions: list[str]
+    trace_log: list[str]
+    sources: list[dict[str, Any]]
+    key_evidence: list[dict[str, Any]]
+    meta: dict[str, Any]
     search_time: float
-    agents_used: int
 
 
 class AnalyzeOrchestrator:
@@ -53,134 +68,390 @@ class AnalyzeOrchestrator:
     ):
         self.searxng = searxng_client
         self.llm = llm_client
-        self.agent_urls = agent_urls
+        self.agent_urls = max(4, agent_urls)
         self.agent_count = max(2, agent_count)
-        self.contradiction_agents = max(0, contradiction_agents)
-        self.reporter = ReportGenerator(llm_client)
+        self.contradiction_agents = max(1, contradiction_agents or 2)
         self._llm_semaphore = asyncio.Semaphore(max(1, llm_parallel))
 
     async def analyze(self, query: str) -> AnalyzeResult:
-        start = time.time()
+        started_at = time.perf_counter()
+        intent = classify_query_intent(query)
+        query_mode = classify_query_mode(query)
+        sub_queries = self._build_analyze_sub_queries(query, self.agent_count, query_mode=query_mode)
+        logger.info("Analyze v2: query=%s sub_queries=%s", query, len(sub_queries))
 
-        async def run_agent(sub_query: str, excluded: Optional[set[str]] = None) -> SkimResult:
-            agent = SkimAgent(self.searxng, self.llm, max_urls=self.agent_urls)
-            return await agent.search_and_report(sub_query, max_results=self.agent_urls, exclude_urls=excluded)
+        async def run_variant(sub_query: str) -> list[Any]:
+            return await self.searxng.search(
+                query=sub_query,
+                max_results=self.agent_urls * 3,
+                strict=False,
+            )
 
-        sub_queries = self._build_analyze_sub_queries(query, self.agent_count)
-        agent_runs: List[SkimResult] = []
-        excluded_urls: set[str] = set()
-
-        for sub_query in sub_queries:
-            run = await run_agent(sub_query, excluded=excluded_urls)
-            agent_runs.append(run)
-            for src in run.sources:
-                key = normalize_url(src.get("url", ""))
-                if key:
-                    excluded_urls.add(key)
-
-        reports = [run.report for run in agent_runs]
-        labels = [f"Skim Agent {idx}" for idx in range(1, len(agent_runs) + 1)]
-
-        merge_variants = await self._build_analyze_merge_variants(query, reports, labels)
-        merged = await self.reporter.compose_comprehensive_analysis_report(
-            query=query,
-            agent_reports=[
-                {
-                    "agent": idx + 1,
-                    "query": sub_queries[idx],
-                    "report": run.report,
-                    "sources_count": run.sources_count,
-                }
-                for idx, run in enumerate(agent_runs)
-            ],
-            contradiction_reports=merge_variants,
-        )
-
-        primary_a = agent_runs[0] if agent_runs else SkimResult(
-            query=query,
-            report="",
-            sources=[],
-            skim_reports=[],
-            skim_agent_runs=[],
-            sources_count=0,
-            search_time=0.0,
-        )
-        primary_b = agent_runs[1] if len(agent_runs) > 1 else primary_a
-
-        agent_reports = [
+        batches = await asyncio.gather(*[run_variant(sub_query) for sub_query in sub_queries])
+        candidates = [
             {
-                "agent": idx + 1,
-                "query": sub_queries[idx],
-                "report": run.report,
-                "sources_count": run.sources_count,
+                "url": row.url,
+                "title": row.title,
+                "content": row.content,
+                "engine": row.engine,
             }
-            for idx, run in enumerate(agent_runs)
+            for batch in batches
+            for row in batch
         ]
+        candidates = dedupe_sources(candidates, limit=max(self.agent_urls * self.agent_count * 3, 30))
+        if candidates:
+            candidates = await self.searxng.enrich_sources_with_content(
+                candidates,
+                max_length=5000,
+                max_parallel=6,
+            )
+
+        ranked_rows = rank_sources(query, candidates, self.agent_urls * self.agent_count, intent)
+        source_primitives = make_source_primitives(ranked_rows)
+        evidence_rows = make_evidence_primitives(query, ranked_rows)
+        max_claims = max(16, self.agent_count * 10)
+        if query_mode == "fact":
+            max_claims = min(max_claims, 24)
+        claims = make_claim_primitives(evidence_rows, max_claims=max_claims)
+        consensus_claims, disputed_claims = split_consensus_disputed(claims)
+
+        if query_mode == "fact":
+            decision_matrix: list[dict[str, Any]] = []
+            recommended_position = self._factual_position(
+                query,
+                consensus_claims,
+                disputed_claims,
+                evidence_rows,
+            )
+        else:
+            decision_matrix = self._build_decision_matrix(
+                consensus_claims,
+                disputed_claims,
+                source_primitives,
+            )
+            recommended_position = self._recommended_position(decision_matrix)
+        sensitivity_factors = self._sensitivity_factors(
+            consensus_claims,
+            disputed_claims,
+            source_primitives,
+            query_mode=query_mode,
+        )
+
+        payload = {
+            "query": query,
+            "consensus_claims": consensus_claims,
+            "disputed_claims": disputed_claims,
+            "decision_matrix": decision_matrix,
+            "recommended_position": recommended_position,
+            "sensitivity_factors": sensitivity_factors,
+            "sources": source_primitives,
+            "key_evidence": evidence_rows,
+        }
+        payload["_meta"] = build_meta(started_at, payload)
 
         return AnalyzeResult(
             query=query,
-            report=merged,
-            report_a=primary_a.report,
-            report_b=primary_b.report,
-            sources_a=primary_a.sources_count,
-            sources_b=primary_b.sources_count,
-            agent_reports=agent_reports,
-            agent_count=len(agent_runs),
-            merge_reports=merge_variants,
-            merge_agent_count=len(merge_variants),
-            search_time=time.time() - start,
+            query_mode=query_mode,
+            consensus_claims=consensus_claims,
+            disputed_claims=disputed_claims,
+            decision_matrix=decision_matrix,
+            recommended_position=recommended_position,
+            sensitivity_factors=sensitivity_factors,
+            sources=source_primitives,
+            key_evidence=evidence_rows,
+            meta=payload["_meta"],
+            search_time=time.perf_counter() - started_at,
         )
 
-    async def _build_analyze_merge_variants(
-        self,
+    @staticmethod
+    def _factual_position(
         query: str,
-        reports: List[str],
-        labels: List[str],
-    ) -> List[Dict[str, Any]]:
-        target = self.contradiction_agents if self.contradiction_agents > 0 else (len(reports) + 1) // 2
-        target = max(1, target)
+        consensus_claims: list[dict[str, Any]],
+        disputed_claims: list[dict[str, Any]],
+        evidence_rows: list[dict[str, Any]],
+    ) -> str:
+        ranked = sorted(
+            consensus_claims,
+            key=lambda claim: len(claim.get("support_evidence_ids", [])),
+            reverse=True,
+        )
+        if not ranked and disputed_claims:
+            ranked = sorted(
+                disputed_claims,
+                key=lambda claim: len(claim.get("support_evidence_ids", [])),
+                reverse=True,
+            )
+        if not ranked:
+            return "Insufficient evidence to extract stable factual findings."
 
-        goals = [
-            "Focus on contradictions, disputed claims, and evidence-quality gaps.",
-            "Focus on practical tradeoffs, risks, and implementation caveats.",
-            "Focus on strongest consensus points and clearly supported findings.",
-            "Focus on uncertainty, missing data, and assumptions.",
-            "Focus on decision-making recommendations backed by citations.",
-            "Focus on counterarguments and where evidence conflicts.",
-        ]
-
-        async def run_variant(idx: int) -> Dict[str, Any]:
-            goal = goals[idx % len(goals)]
-            async with self._llm_semaphore:
-                text = await self.reporter.merge_multiple_reports(
-                    query=query,
-                    reports=reports,
-                    labels=labels,
-                    merge_goal=goal,
-                )
-            return {"agent": idx + 1, "label": f"Merge Agent {idx + 1}", "goal": goal, "report": text}
-
-        tasks = [asyncio.create_task(run_variant(i)) for i in range(target)]
-        return await asyncio.gather(*tasks)
+        facts = cited_bullet_summary(query, ranked, evidence_rows, max_lines=6)
+        if disputed_claims:
+            return "Key facts from retrieved sources (some evidence remains disputed):\n" + facts
+        return "Key facts from retrieved sources:\n" + facts
 
     @staticmethod
-    def _build_analyze_sub_queries(query: str, count: int) -> List[str]:
-        templates = [
-            "{q}",
-            "{q} alternative viewpoints",
-            "{q} pros and cons",
-            "{q} expert consensus",
-            "{q} recent developments",
-            "{q} practical implications",
-            "{q} risks and limitations",
-            "{q} implementation guidance",
-            "{q} case studies",
-            "{q} evidence quality",
-            "{q} policy and regulation",
-            "{q} common misconceptions",
+    def _build_decision_matrix(
+        consensus_claims: list[dict[str, Any]],
+        disputed_claims: list[dict[str, Any]],
+        sources: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        consensus_n = len(consensus_claims)
+        disputed_n = len(disputed_claims)
+        total_claims = max(1, consensus_n + disputed_n)
+        consensus_ratio = consensus_n / total_claims
+        dispute_ratio = disputed_n / total_claims
+
+        support_counts = [
+            len(claim.get("support_evidence_ids", [])) for claim in (consensus_claims + disputed_claims)
         ]
-        built: List[str] = []
-        for idx in range(count):
+        avg_support = (sum(support_counts) / len(support_counts)) if support_counts else 0.0
+        support_depth = min(1.0, avg_support / 3.0)
+
+        trust_scores = [float(src.get("domain_trust_score", 0.0)) for src in sources]
+        avg_trust = (sum(trust_scores) / len(trust_scores)) if trust_scores else 0.6
+        low_trust_share = (
+            len([score for score in trust_scores if score < 0.65]) / len(trust_scores) if trust_scores else 0.0
+        )
+
+        hosts = [urlparse(src.get("url", "")).netloc.lower() for src in sources if src.get("url")]
+        unique_hosts = len(set(host for host in hosts if host))
+        source_diversity = (unique_hosts / len(hosts)) if hosts else 0.6
+
+        def bounded(value: float) -> int:
+            return int(max(5, min(95, round(value))))
+
+        proceed_score = bounded(
+            46
+            + (consensus_ratio * 30)
+            + (support_depth * 14)
+            + (avg_trust * 12)
+            - (dispute_ratio * 32)
+            - (low_trust_share * 16)
+            - ((1.0 - source_diversity) * 10)
+        )
+        guardrails_score = bounded(
+            proceed_score - 10 + (dispute_ratio * 34) + (low_trust_share * 14) + ((1.0 - support_depth) * 6)
+        )
+        defer_score = bounded(
+            (100 - proceed_score) + (dispute_ratio * 25) + ((1.0 - support_depth) * 10)
+        )
+
+        risk_index = (
+            28
+            + (dispute_ratio * 46)
+            + (low_trust_share * 26)
+            + ((1.0 - source_diversity) * 12)
+            - (consensus_ratio * 10)
+        )
+        low_risk_score = bounded(100 - risk_index)
+        medium_risk_score = bounded(100 - (abs(50 - risk_index) * 1.7))
+        high_risk_score = bounded(risk_index)
+
+        ready_score = bounded(
+            38
+            + (consensus_ratio * 30)
+            + (support_depth * 16)
+            + (source_diversity * 10)
+            - (dispute_ratio * 30)
+            - (low_trust_share * 10)
+        )
+        pilot_score = bounded(56 + (dispute_ratio * 16) + ((1.0 - support_depth) * 8) + (low_trust_share * 6))
+        not_ready_score = bounded((100 - ready_score) + (dispute_ratio * 22))
+
+        return [
+            {
+                "dimension": "Evidence Strength",
+                "options": [
+                    {
+                        "option_name": "Proceed",
+                        "score": proceed_score,
+                        "rationale": (
+                            f"{consensus_n} corroborated claims across {len(sources)} sources "
+                            f"(avg trust {avg_trust:.2f}) support moving forward."
+                        ),
+                        "relevant_claim_ids": [claim["claim_id"] for claim in consensus_claims[:6]],
+                    },
+                    {
+                        "option_name": "Proceed with Guardrails",
+                        "score": guardrails_score,
+                        "rationale": (
+                            f"{disputed_n} disputed claims ({dispute_ratio:.0%} of extracted claims) "
+                            "justify mitigation steps and staged rollout."
+                        ),
+                        "relevant_claim_ids": [claim["claim_id"] for claim in disputed_claims[:4]]
+                        + [claim["claim_id"] for claim in consensus_claims[:2]],
+                    },
+                    {
+                        "option_name": "Defer",
+                        "score": defer_score,
+                        "rationale": (
+                            "Defer if unresolved contradictions or shallow claim support would make a "
+                            "wrong decision costly."
+                        ),
+                        "relevant_claim_ids": [claim["claim_id"] for claim in disputed_claims[:4]],
+                    },
+                ],
+            },
+            {
+                "dimension": "Risk Exposure",
+                "options": [
+                    {
+                        "option_name": "Low",
+                        "score": low_risk_score,
+                        "rationale": "Contradiction and source-risk signals are currently limited.",
+                        "relevant_claim_ids": [claim["claim_id"] for claim in consensus_claims[:5]],
+                    },
+                    {
+                        "option_name": "Medium",
+                        "score": medium_risk_score,
+                        "rationale": "Signals indicate manageable but non-trivial downside if assumptions fail.",
+                        "relevant_claim_ids": [claim["claim_id"] for claim in disputed_claims[:5]],
+                    },
+                    {
+                        "option_name": "High",
+                        "score": high_risk_score,
+                        "rationale": "Conflicts and lower-trust evidence could materially alter outcomes.",
+                        "relevant_claim_ids": [claim["claim_id"] for claim in disputed_claims[:6]],
+                    },
+                ],
+            },
+            {
+                "dimension": "Implementation Readiness",
+                "options": [
+                    {
+                        "option_name": "Ready",
+                        "score": ready_score,
+                        "rationale": "Consensus depth and source spread are sufficient for full execution.",
+                        "relevant_claim_ids": [claim["claim_id"] for claim in consensus_claims[:6]],
+                    },
+                    {
+                        "option_name": "Pilot",
+                        "score": pilot_score,
+                        "rationale": "Best fit when directional evidence exists but uncertainty still matters.",
+                        "relevant_claim_ids": [claim["claim_id"] for claim in consensus_claims[:3]]
+                        + [claim["claim_id"] for claim in disputed_claims[:3]],
+                    },
+                    {
+                        "option_name": "Not Ready",
+                        "score": not_ready_score,
+                        "rationale": "Hold if conflict resolution and corroboration are still too thin.",
+                        "relevant_claim_ids": [claim["claim_id"] for claim in disputed_claims[:6]],
+                    },
+                ],
+            },
+        ]
+
+    @staticmethod
+    def _recommended_position(decision_matrix: list[dict[str, Any]]) -> str:
+        if not decision_matrix:
+            return "Insufficient evidence to form a stable recommendation."
+        first_dimension = decision_matrix[0]
+        options = first_dimension.get("options", [])
+        if not options:
+            return "Insufficient evidence to form a stable recommendation."
+        ranked = sorted(options, key=lambda row: row.get("score", 0), reverse=True)
+        best = ranked[0]
+        runner_up = ranked[1] if len(ranked) > 1 else None
+        margin = int(best.get("score", 0)) - int(runner_up.get("score", 0)) if runner_up else 0
+        confidence = "high" if int(best.get("score", 0)) >= 75 and margin >= 12 else "moderate"
+        if int(best.get("score", 0)) < 60:
+            confidence = "low"
+        rationale = (best.get("rationale", "") or "").strip().rstrip(".")
+        return (
+            f"Recommended position: {best.get('option_name', 'Proceed with Guardrails')} "
+            f"(score={best.get('score', 0)}/100, confidence={confidence}). {rationale}."
+        )
+
+    @staticmethod
+    def _sensitivity_factors(
+        consensus_claims: list[dict[str, Any]],
+        disputed_claims: list[dict[str, Any]],
+        sources: list[dict[str, Any]],
+        query_mode: str = "general",
+    ) -> list[str]:
+        factors: list[str] = []
+        total_claims = max(1, len(consensus_claims) + len(disputed_claims))
+        disputed_n = len(disputed_claims)
+        if disputed_n:
+            label = "findings" if query_mode == "fact" else "recommendation"
+            factors.append(
+                f"{disputed_n}/{total_claims} extracted claims are disputed; {label} shifts if key conflicts resolve differently."
+            )
+            claim = disputed_claims[0]
+            support = len(claim.get("support_evidence_ids", []))
+            refute = len(claim.get("refute_evidence_ids", []))
+            factors.append(
+                f"Most sensitive claim: {claim.get('statement', '')[:140]} (support={support}, refute_links={refute})."
+            )
+
+        trust_scores = [float(src.get("domain_trust_score", 0.0)) for src in sources]
+        low_trust_count = len([score for score in trust_scores if score < 0.65])
+        if trust_scores and low_trust_count:
+            factors.append(
+                f"{low_trust_count}/{len(trust_scores)} sources have trust < 0.65; source vetting materially affects confidence."
+            )
+
+        hosts = [urlparse(src.get("url", "")).netloc.lower() for src in sources if src.get("url")]
+        if hosts:
+            host_counts: dict[str, int] = {}
+            for host in hosts:
+                host_counts[host] = host_counts.get(host, 0) + 1
+            top_host, top_count = max(host_counts.items(), key=lambda item: item[1])
+            concentration = top_count / len(hosts)
+            if concentration >= 0.45 and len(hosts) >= 4:
+                factors.append(
+                    f"{top_count}/{len(hosts)} sources come from {top_host}; broader domain diversity could change conclusions."
+                )
+
+        if consensus_claims:
+            thin_consensus = [claim for claim in consensus_claims if len(claim.get("support_evidence_ids", [])) <= 1]
+            if len(thin_consensus) / len(consensus_claims) >= 0.5:
+                factors.append(
+                    f"{len(thin_consensus)}/{len(consensus_claims)} consensus claims are single-source and sensitive to new corroboration."
+                )
+
+        if not factors:
+            avg_trust = (sum(trust_scores) / len(trust_scores)) if trust_scores else 0.0
+            factors.append(
+                f"No dominant sensitivity drivers detected (avg trust={avg_trust:.2f}, disputed={disputed_n}/{total_claims})."
+            )
+        return factors[:4]
+
+    @staticmethod
+    def _build_analyze_sub_queries(query: str, count: int, query_mode: Optional[str] = None) -> list[str]:
+        mode = query_mode or classify_query_mode(query)
+        if mode == "fact":
+            templates = [
+                "{q}",
+                "{q} definition and scope",
+                "{q} core characteristics",
+                "{q} mechanisms and causes",
+                "{q} prevalence and statistics",
+                "{q} expert consensus",
+                "{q} conflicting claims",
+                "{q} recent evidence",
+                "{q} common misconceptions",
+                "{q} evidence quality",
+                "{q} primary sources",
+                "{q} unresolved questions",
+            ]
+        else:
+            templates = [
+                "{q}",
+                "{q} alternative viewpoints",
+                "{q} pros and cons",
+                "{q} expert consensus",
+                "{q} recent developments",
+                "{q} practical implications",
+                "{q} risks and limitations",
+                "{q} implementation guidance",
+                "{q} case studies",
+                "{q} evidence quality",
+                "{q} policy and regulation",
+                "{q} common misconceptions",
+            ]
+        built: list[str] = []
+        for idx in range(max(1, count)):
             if idx < len(templates):
                 built.append(templates[idx].format(q=query))
             else:
@@ -189,7 +460,7 @@ class AnalyzeOrchestrator:
 
 
 class DeepSearchOrchestrator:
-    """Orchestrates sub-queries and chunked synthesis for deep research."""
+    """Iterative planner-reviewer deep research pipeline for MCP-first output."""
 
     def __init__(
         self,
@@ -203,44 +474,168 @@ class DeepSearchOrchestrator:
         self.llm = llm_client
         self.max_concurrent = max(1, max_concurrent_agents)
         self.max_results = max(3, max_results_per_agent)
-        self.reporter = ReportGenerator(llm_client)
         self._agent_semaphore = asyncio.Semaphore(self.max_concurrent)
         self._llm_semaphore = asyncio.Semaphore(max(1, llm_parallel))
 
     async def search(self, query: str, num_sub_queries: int = 6, depth: int = 2) -> DeepSearchResult:
-        del depth
-        start_time = time.time()
-        logger.info("Research: starting query='%s'", query)
-
+        started_at = time.perf_counter()
+        logger.info("Research v2: query=%s", query)
         target_sub_queries = max(1, min(num_sub_queries, self.max_concurrent))
-        sub_queries = await self._generate_sub_queries(query, target_sub_queries)
-        agent_results = await self._run_sub_agents_parallel(sub_queries)
-        agent_run_metrics = [
-            item.get("_meta", {})
-            for item in agent_results
-            if isinstance(item, dict) and item.get("_meta")
-        ]
-        clustered = self._cluster_results(agent_results)
-        cluster_reports = await self._write_cluster_reports(query, clustered["by_query"])
-        synthesis_reports = await self._write_synthesis_reports(query, cluster_reports)
+        max_cycles = max(1, min(depth, 4))
+
+        active_queries = await self._generate_sub_queries(query, target_sub_queries)
+        seen_queries = {item.lower() for item in active_queries}
+
+        source_bank: dict[str, dict[str, Any]] = {}
+        trace_log: list[str] = []
+        open_questions: list[str] = []
+        previous_claim_count = 0
+        stopping_reason = "budget_exhausted"
+
+        for cycle in range(1, max_cycles + 1):
+            trace_log.append(f"cycle_{cycle}: planner selected {len(active_queries)} sub-queries")
+            agent_results = await self._run_sub_agents_parallel(active_queries)
+
+            added_in_cycle = 0
+            for run in agent_results:
+                for source in run.get("results", []):
+                    key = normalize_url(source.get("url", ""))
+                    if not key or key in source_bank:
+                        continue
+                    source_bank[key] = source
+                    added_in_cycle += 1
+
+            ranked_rows = rank_sources(
+                query,
+                list(source_bank.values()),
+                target=min(len(source_bank), max(20, target_sub_queries * self.max_results)),
+                default_intent=classify_query_intent(query),
+            )
+            sources = make_source_primitives(ranked_rows)
+            evidence_rows = make_evidence_primitives(query, ranked_rows)
+            claims = make_claim_primitives(evidence_rows, max_claims=160)
+            consensus_claims, disputed_claims = split_consensus_disputed(claims)
+
+            claim_delta = len(claims) - previous_claim_count
+            previous_claim_count = len(claims)
+            trace_log.append(
+                f"cycle_{cycle}: +{added_in_cycle} sources, claims={len(claims)}, delta={claim_delta}"
+            )
+
+            open_questions = self._derive_open_questions(query, consensus_claims, disputed_claims, sources)
+            if claim_delta <= 2:
+                stopping_reason = "saturation_reached"
+                trace_log.append(f"cycle_{cycle}: stopping, marginal claim gain <= 2")
+                break
+
+            if cycle >= max_cycles:
+                stopping_reason = "budget_exhausted"
+                trace_log.append(f"cycle_{cycle}: stopping, cycle budget exhausted")
+                break
+
+            planned = await self._plan_followup_queries(query, open_questions, target_sub_queries)
+            next_queries: list[str] = []
+            for sub_query in planned:
+                key = sub_query.lower()
+                if key in seen_queries:
+                    continue
+                seen_queries.add(key)
+                next_queries.append(sub_query)
+                if len(next_queries) >= target_sub_queries:
+                    break
+
+            if not next_queries:
+                stopping_reason = "saturation_reached"
+                trace_log.append(f"cycle_{cycle}: stopping, planner produced no novel sub-queries")
+                break
+            active_queries = next_queries
+
+        ranked_rows = rank_sources(
+            query,
+            list(source_bank.values()),
+            target=min(len(source_bank), max(25, target_sub_queries * self.max_results)),
+            default_intent=classify_query_intent(query),
+        )
+        source_primitives = make_source_primitives(ranked_rows)
+        evidence_rows = make_evidence_primitives(query, ranked_rows)
+        claims = make_claim_primitives(evidence_rows, max_claims=200)
+        consensus_claims, disputed_claims = split_consensus_disputed(claims)
+        final_claims = consensus_claims + disputed_claims
+        edges = make_edges_from_claims(final_claims)
+        open_questions = self._derive_open_questions(
+            query,
+            consensus_claims,
+            disputed_claims,
+            source_primitives,
+            edges=edges,
+            evidence_rows=evidence_rows,
+        )
+        evidence_trace = self._build_evidence_trace(final_claims, edges, evidence_rows, max_items=8)
+
+        final_synthesis = self._compose_final_synthesis(
+            query=query,
+            consensus_claims=consensus_claims,
+            disputed_claims=disputed_claims,
+            evidence_rows=evidence_rows,
+            edges=edges,
+            open_questions=open_questions,
+        )
+        coverage_report = {
+            "nodes_explored": len(final_claims),
+            "edges_explored": len(edges),
+            "consensus_claims": len(consensus_claims),
+            "disputed_claims": len(disputed_claims),
+            "sources_considered": len(source_primitives),
+            "evidence_items": len(evidence_rows),
+            "contradiction_edges": sum(
+                1 for edge in edges if edge.get("relationship") == "contradicts"
+            ),
+            "evidence_trace": evidence_trace,
+            "stopping_reason": stopping_reason,
+        }
+
+        payload = {
+            "query": query,
+            "final_synthesis": final_synthesis,
+            "evidence_graph": {
+                "nodes": final_claims,
+                "edges": edges,
+            },
+            "coverage_report": coverage_report,
+            "open_questions": open_questions,
+            "trace_log": trace_log,
+            "sources": source_primitives,
+            "key_evidence": evidence_rows,
+        }
+        payload["_meta"] = build_meta(started_at, payload)
 
         return DeepSearchResult(
             query=query,
-            sub_queries=sub_queries,
-            cluster_reports=cluster_reports,
-            synthesis_reports=synthesis_reports,
-            agent_runs=agent_run_metrics,
-            final_report="",
-            total_sources=len(clustered["all_sources"]),
-            search_time=time.time() - start_time,
-            agents_used=len(agent_results),
+            final_synthesis=final_synthesis,
+            evidence_graph=payload["evidence_graph"],
+            coverage_report=coverage_report,
+            open_questions=open_questions,
+            trace_log=trace_log,
+            sources=source_primitives,
+            key_evidence=evidence_rows,
+            meta=payload["_meta"],
+            search_time=time.perf_counter() - started_at,
         )
 
-    async def _generate_sub_queries(self, query: str, num_queries: int) -> List[str]:
-        prompt = (
-            f"Generate {num_queries} focused web research sub-queries for: '{query}'.\n"
-            "Return only a JSON array of strings. Avoid generic words like history/current/technology unless required."
-        )
+    async def _generate_sub_queries(self, query: str, num_queries: int) -> list[str]:
+        mode = classify_query_mode(query)
+        if mode == "fact":
+            prompt = (
+                f"Generate {num_queries} focused web research sub-queries for: '{query}'.\n"
+                "Aim for broad factual coverage (definition, anatomy, habitat, behavior, lifecycle, ecology).\n"
+                "Avoid shopping pages, pest-control-only pages, and acronym-only matches unless requested.\n"
+                "Return only a JSON array of strings."
+            )
+        else:
+            prompt = (
+                f"Generate {num_queries} focused web research sub-queries for: '{query}'.\n"
+                "Return only a JSON array of strings. Avoid generic words like history/current/technology unless required."
+            )
         response = await self.llm.complete(prompt=prompt, temperature=0.5)
         try:
             parsed = json.loads(response.content.strip())
@@ -251,19 +646,29 @@ class DeepSearchOrchestrator:
         except Exception:
             logger.warning("Research sub-query parsing failed, using fallback")
 
-        fallback = [
-            f"{query} overview",
-            f"{query} key facts",
-            f"{query} expert analysis",
-            f"{query} recent developments",
-            f"{query} conflicting viewpoints",
-            f"{query} practical implications",
-        ]
+        if mode == "fact":
+            fallback = [
+                f"{query} definition and taxonomy",
+                f"{query} anatomy and physiology",
+                f"{query} habitat and distribution",
+                f"{query} diet and behavior",
+                f"{query} lifecycle and reproduction",
+                f"{query} ecological role and predators",
+            ]
+        else:
+            fallback = [
+                f"{query} overview",
+                f"{query} key facts",
+                f"{query} expert analysis",
+                f"{query} recent developments",
+                f"{query} conflicting viewpoints",
+                f"{query} practical implications",
+            ]
         return self._ensure_sub_query_count(query, fallback, num_queries)
 
     @staticmethod
-    def _ensure_sub_query_count(query: str, candidates: List[str], target: int) -> List[str]:
-        normalized: List[str] = []
+    def _ensure_sub_query_count(query: str, candidates: list[str], target: int) -> list[str]:
+        normalized: list[str] = []
         seen: set[str] = set()
 
         for item in candidates:
@@ -289,127 +694,345 @@ class DeepSearchOrchestrator:
 
         return normalized
 
-    async def _run_sub_agents_parallel(self, sub_queries: List[str]) -> List[Dict[str, Any]]:
+    async def _run_sub_agents_parallel(self, sub_queries: list[str]) -> list[dict[str, Any]]:
         active_count = 0
         active_peak = 0
         counter_lock = asyncio.Lock()
 
-        async def run_single(q: str) -> Dict[str, Any]:
+        async def run_single(sub_query: str) -> dict[str, Any]:
             nonlocal active_count, active_peak
             async with self._agent_semaphore:
-                start = time.time()
+                started = time.perf_counter()
                 async with counter_lock:
                     active_count += 1
                     active_peak = max(active_peak, active_count)
-                    active_now = active_count
-                logger.info("Research agent start query='%s' active=%s", q, active_now)
                 worker = QuickSearchSubAgent(self.searxng, max_urls=self.max_results)
                 try:
-                    result = await worker.search_lightweight(q, self.max_results)
+                    result = await worker.search_lightweight(sub_query, self.max_results)
                     result["_meta"] = {
-                        "query": q,
-                        "started_at": start,
-                        "duration_s": round(time.time() - start, 2),
+                        "query": sub_query,
+                        "duration_s": round(time.perf_counter() - started, 2),
                         "status": "ok",
                     }
                     return result
                 except Exception as exc:
                     return {
-                        "query": q,
+                        "query": sub_query,
                         "results": [],
                         "count": 0,
                         "error": str(exc),
                         "_meta": {
-                            "query": q,
-                            "started_at": start,
-                            "duration_s": round(time.time() - start, 2),
+                            "query": sub_query,
+                            "duration_s": round(time.perf_counter() - started, 2),
                             "status": "error",
                         },
                     }
                 finally:
                     async with counter_lock:
                         active_count = max(0, active_count - 1)
-                        active_now = active_count
-                    logger.info("Research agent done query='%s' active=%s", q, active_now)
 
-        tasks = [asyncio.create_task(run_single(q)) for q in sub_queries]
+        tasks = [asyncio.create_task(run_single(sub_query)) for sub_query in sub_queries]
         completed = await asyncio.gather(*tasks, return_exceptions=True)
-        results: List[Dict[str, Any]] = []
-        for i, item in enumerate(completed):
+        rows: list[dict[str, Any]] = []
+        for idx, item in enumerate(completed):
             if isinstance(item, Exception):
-                logger.error("Research agent failed for '%s': %s", sub_queries[i], item)
-                results.append({"query": sub_queries[i], "results": [], "count": 0, "error": str(item)})
-            else:
-                results.append(item)
-        logger.info("Research agent parallel peak=%s", active_peak)
-        return results
-
-    def _cluster_results(self, agent_results: List[Dict[str, Any]]) -> Dict[str, Any]:
-        all_sources: List[Dict[str, Any]] = []
-        by_query = []
-
-        for agent_result in agent_results:
-            query = agent_result.get("query", "unknown")
-            deduped = dedupe_sources(agent_result.get("results", []), self.max_results)
-            by_query.append({"query": query, "results": deduped, "count": len(deduped)})
-            for src in deduped:
-                all_sources.append(
+                rows.append(
                     {
-                        "query_origin": query,
-                        "url": src.get("url", ""),
-                        "title": src.get("title", ""),
-                        "content": src.get("content", ""),
-                        "engine": src.get("engine", "unknown"),
+                        "query": sub_queries[idx],
+                        "results": [],
+                        "count": 0,
+                        "error": str(item),
+                        "_meta": {"query": sub_queries[idx], "status": "error", "duration_s": 0.0},
                     }
                 )
-
-        all_sources = dedupe_sources(all_sources, limit=400)
-        return {"by_query": by_query, "all_sources": all_sources}
-
-    async def _write_cluster_reports(self, query: str, clusters: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        async def write_for_cluster(cluster: Dict[str, Any]) -> Dict[str, Any]:
-            title = cluster.get("query", "cluster")
-            if not cluster.get("results"):
-                return {"query": title, "report": "No evidence collected for this cluster.", "sources": 0}
-
-            async with self._llm_semaphore:
-                report = await self.reporter.write_report(
-                    query=f"{query} / {title}",
-                    sources=cluster["results"],
-                    style="focused, evidence-based",
-                )
-            return {"query": title, "report": report.report, "sources": len(cluster["results"])}
-
-        tasks = [asyncio.create_task(write_for_cluster(c)) for c in clusters]
-        return await asyncio.gather(*tasks)
-
-    async def _write_synthesis_reports(self, query: str, cluster_reports: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        if not cluster_reports:
-            return []
-
-        groups = self._group_clusters(cluster_reports)
-
-        async def write_group(group_index: int, group_items: List[Dict[str, Any]]) -> Dict[str, Any]:
-            reports = [item.get("report", "") for item in group_items]
-            labels = [item.get("query", f"cluster-{i+1}") for i, item in enumerate(group_items)]
-            merged = await self.reporter.merge_multiple_reports(
-                query=f"{query} synthesis block {group_index + 1}",
-                reports=reports,
-                labels=labels,
-                merge_goal="Produce a comprehensive synthesis preserving important details from each source cluster.",
-            )
-            return {
-                "group": group_index + 1,
-                "queries": labels,
-                "report": merged,
-                "cluster_count": len(group_items),
-            }
-
-        tasks = [asyncio.create_task(write_group(i, group)) for i, group in enumerate(groups)]
-        return await asyncio.gather(*tasks)
+            else:
+                rows.append(item)
+        logger.info("Research v2 sub-agent peak parallelism=%s", active_peak)
+        return rows
 
     @staticmethod
-    def _group_clusters(cluster_reports: List[Dict[str, Any]]) -> List[List[Dict[str, Any]]]:
+    def _derive_open_questions(
+        query: str,
+        consensus_claims: list[dict[str, Any]],
+        disputed_claims: list[dict[str, Any]],
+        sources: list[dict[str, Any]],
+        edges: Optional[list[dict[str, Any]]] = None,
+        evidence_rows: Optional[list[dict[str, Any]]] = None,
+    ) -> list[str]:
+        questions: list[str] = []
+        evidence_rows = evidence_rows or []
+        edges = edges or []
+
+        ranked_disputed = sorted(
+            disputed_claims,
+            key=lambda claim: (
+                len(claim.get("support_evidence_ids", [])),
+                len(claim.get("refute_evidence_ids", [])),
+            ),
+            reverse=True,
+        )
+        for claim in ranked_disputed[:3]:
+            statement = (claim.get("statement", "") or "").strip().rstrip(".")
+            if statement:
+                questions.append(f"What primary-source evidence can confirm or refute: {statement}?")
+
+        contradiction_edges = [edge for edge in edges if edge.get("relationship") == "contradicts"]
+        if contradiction_edges:
+            questions.append("Which contradiction clusters in the evidence graph are highest-impact to resolve first?")
+
+        weak_consensus = [
+            claim
+            for claim in consensus_claims
+            if len(claim.get("support_evidence_ids", [])) <= 1
+        ]
+        if weak_consensus and len(weak_consensus) >= max(2, len(consensus_claims) // 2):
+            questions.append("Which consensus findings still rely on single-source support and need replication?")
+
+        host_set = {
+            urlparse((source.get("url", "") or "").strip()).netloc.lower().removeprefix("www.")
+            for source in sources
+            if isinstance(source, dict)
+        }
+        host_set = {host for host in host_set if host}
+        if len(host_set) < max(4, min(8, len(sources) // 2)):
+            questions.append("Which additional independent domains can improve evidence diversity and reduce bias?")
+
+        if evidence_rows and len(consensus_claims) + len(disputed_claims) < max(5, len(evidence_rows) // 5):
+            questions.append(f"What claims for '{query}' remain unmodeled in the current evidence graph?")
+
+        if len(consensus_claims) < 4:
+            questions.append(f"Gather stronger multi-source consensus evidence for: {query}.")
+        if not questions:
+            questions.append("No major unresolved questions; validate edge-case scenarios.")
+        return questions[:5]
+
+    @staticmethod
+    def _compose_final_synthesis(
+        query: str,
+        consensus_claims: list[dict[str, Any]],
+        disputed_claims: list[dict[str, Any]],
+        evidence_rows: list[dict[str, Any]],
+        edges: list[dict[str, Any]],
+        open_questions: list[str],
+    ) -> str:
+        all_claims = consensus_claims + disputed_claims
+        if not all_claims:
+            return "Report\n\nNo stable synthesis could be generated from retrieved evidence."
+
+        evidence_map = {item.get("evidence_id", ""): item for item in evidence_rows}
+        ranked_consensus = sorted(
+            consensus_claims,
+            key=lambda claim: len(claim.get("support_evidence_ids", [])),
+            reverse=True,
+        )
+        ranked_disputed = sorted(
+            disputed_claims,
+            key=lambda claim: (
+                len(claim.get("support_evidence_ids", [])),
+                len(claim.get("refute_evidence_ids", [])),
+            ),
+            reverse=True,
+        )
+        contradiction_pairs = DeepSearchOrchestrator._top_contradiction_pairs(
+            ranked_disputed,
+            edges,
+            evidence_map,
+            max_pairs=3,
+        )
+        trace_rows = DeepSearchOrchestrator._build_evidence_trace(all_claims, edges, evidence_rows, max_items=6)
+
+        lines: list[str] = ["Report", "", f"Query: {query}", "", "## Executive Summary"]
+
+        summary_claims = ranked_consensus[:5] if ranked_consensus else all_claims[:5]
+        for claim in summary_claims:
+            statement = (claim.get("statement", "") or "").strip()
+            if not statement:
+                continue
+            citation = DeepSearchOrchestrator._claim_citations(claim, evidence_map)
+            lines.append(f"- {statement} {citation}".strip())
+
+        if not summary_claims:
+            lines.append("- Insufficient high-confidence evidence was available for synthesis.")
+
+        lines.extend(["", "## Contradictions and Uncertainty"])
+        if contradiction_pairs:
+            for pair in contradiction_pairs:
+                lines.append(
+                    (
+                        "- "
+                        f"{pair['left_statement']} vs {pair['right_statement']} "
+                        f"{pair['citations']}"
+                    ).strip()
+                )
+        elif ranked_disputed:
+            for claim in ranked_disputed[:3]:
+                statement = (claim.get("statement", "") or "").strip()
+                citation = DeepSearchOrchestrator._claim_citations(claim, evidence_map)
+                lines.append(f"- Disputed finding: {statement} {citation}".strip())
+        else:
+            lines.append("- No material contradiction edges were detected in the final graph.")
+
+        lines.extend(["", "## Evidence Graph Trace"])
+        if trace_rows:
+            for row in trace_rows:
+                src_citations = " ".join(f"[{src}]" for src in row.get("source_ids", []))
+                evidence_ids = ", ".join(row.get("evidence_ids", []))
+                lines.append(
+                    (
+                        "- "
+                        f"{row.get('claim_id', '?')} <- {evidence_ids} "
+                        f"{src_citations} "
+                        f"(contradiction_links={row.get('contradiction_links', 0)})"
+                    ).strip()
+                )
+        else:
+            lines.append("- Evidence trace links were too weak to summarize reliably.")
+
+        if open_questions:
+            lines.extend(["", "## Open Questions"])
+            for item in open_questions[:5]:
+                lines.append(f"- {item}")
+
+        return "\n".join(lines).strip()
+
+    @staticmethod
+    def _claim_citations(claim: dict[str, Any], evidence_map: dict[str, dict[str, Any]], limit: int = 3) -> str:
+        source_ids: list[str] = []
+        evidence_ids = claim.get("support_evidence_ids", []) + claim.get("refute_evidence_ids", [])
+        for evidence_id in evidence_ids:
+            source_id = evidence_map.get(evidence_id, {}).get("source_id", "")
+            if source_id and source_id not in source_ids:
+                source_ids.append(source_id)
+        if not source_ids:
+            return ""
+        return " ".join(f"[{source}]" for source in source_ids[:limit])
+
+    @staticmethod
+    def _top_contradiction_pairs(
+        disputed_claims: list[dict[str, Any]],
+        edges: list[dict[str, Any]],
+        evidence_map: dict[str, dict[str, Any]],
+        max_pairs: int,
+    ) -> list[dict[str, str]]:
+        claim_map = {claim.get("claim_id", ""): claim for claim in disputed_claims}
+        scored_pairs: list[tuple[int, dict[str, str]]] = []
+        seen_pairs: set[str] = set()
+
+        for edge in edges:
+            if edge.get("relationship") != "contradicts":
+                continue
+            left_id = edge.get("source_claim_id", "")
+            right_id = edge.get("target_claim_id", "")
+            if left_id not in claim_map or right_id not in claim_map:
+                continue
+
+            pair_key = "::".join(sorted([left_id, right_id]))
+            if pair_key in seen_pairs:
+                continue
+            seen_pairs.add(pair_key)
+
+            left = claim_map[left_id]
+            right = claim_map[right_id]
+            support_weight = len(left.get("support_evidence_ids", [])) + len(right.get("support_evidence_ids", []))
+            citation = DeepSearchOrchestrator._claim_citations(
+                {
+                    "support_evidence_ids": left.get("support_evidence_ids", [])
+                    + right.get("support_evidence_ids", []),
+                    "refute_evidence_ids": left.get("refute_evidence_ids", [])
+                    + right.get("refute_evidence_ids", []),
+                },
+                evidence_map,
+            )
+
+            scored_pairs.append(
+                (
+                    support_weight,
+                    {
+                        "left_statement": (left.get("statement", "") or "").strip(),
+                        "right_statement": (right.get("statement", "") or "").strip(),
+                        "citations": citation,
+                    },
+                )
+            )
+
+        scored_pairs.sort(key=lambda item: item[0], reverse=True)
+        return [item[1] for item in scored_pairs[:max_pairs]]
+
+    @staticmethod
+    def _build_evidence_trace(
+        claims: list[dict[str, Any]],
+        edges: list[dict[str, Any]],
+        evidence_rows: list[dict[str, Any]],
+        max_items: int = 8,
+    ) -> list[dict[str, Any]]:
+        evidence_map = {item.get("evidence_id", ""): item for item in evidence_rows}
+        contradiction_counts: dict[str, int] = {}
+        for edge in edges:
+            if edge.get("relationship") != "contradicts":
+                continue
+            left = edge.get("source_claim_id", "")
+            right = edge.get("target_claim_id", "")
+            contradiction_counts[left] = contradiction_counts.get(left, 0) + 1
+            contradiction_counts[right] = contradiction_counts.get(right, 0) + 1
+
+        ranked_claims = sorted(
+            claims,
+            key=lambda claim: (
+                len(claim.get("support_evidence_ids", [])),
+                contradiction_counts.get(claim.get("claim_id", ""), 0),
+            ),
+            reverse=True,
+        )
+
+        trace_rows: list[dict[str, Any]] = []
+        for claim in ranked_claims[:max_items]:
+            support_ids = list(dict.fromkeys(claim.get("support_evidence_ids", [])[:4]))
+            source_ids: list[str] = []
+            for evidence_id in support_ids:
+                source_id = evidence_map.get(evidence_id, {}).get("source_id", "")
+                if source_id and source_id not in source_ids:
+                    source_ids.append(source_id)
+            trace_rows.append(
+                {
+                    "claim_id": claim.get("claim_id", ""),
+                    "statement": claim.get("statement", ""),
+                    "evidence_ids": support_ids,
+                    "source_ids": source_ids,
+                    "contradiction_links": contradiction_counts.get(claim.get("claim_id", ""), 0),
+                }
+            )
+        return trace_rows
+
+    async def _plan_followup_queries(self, query: str, open_questions: list[str], target: int) -> list[str]:
+        if not open_questions:
+            return [f"{query} unresolved evidence", f"{query} contradictory findings"][:target]
+
+        prompt = (
+            f"Given query '{query}', propose {target} concise follow-up sub-queries to close these gaps:\n"
+            + "\n".join(f"- {item}" for item in open_questions)
+            + "\nReturn only a JSON array of strings."
+        )
+        async with self._llm_semaphore:
+            response = await self.llm.complete(prompt=prompt, temperature=0.4)
+        try:
+            parsed = json.loads(response.content.strip())
+            if isinstance(parsed, list):
+                normalized = [str(item).strip() for item in parsed if str(item).strip()]
+                if normalized:
+                    return self._ensure_sub_query_count(query, normalized, target)
+        except Exception:
+            logger.warning("Follow-up planner parse failed; using fallback follow-ups")
+
+        fallback = [
+            f"{query} unresolved evidence",
+            f"{query} contradiction analysis",
+            f"{query} primary source verification",
+            f"{query} implementation caveats",
+        ]
+        return self._ensure_sub_query_count(query, fallback, target)
+
+    @staticmethod
+    def _group_clusters(cluster_reports: list[dict[str, Any]]) -> list[list[dict[str, Any]]]:
         """Group cluster reports by sub-agent count, targeting groups of 3.
 
         Examples:
@@ -421,7 +1044,7 @@ class DeepSearchOrchestrator:
         if n <= 3:
             return [cluster_reports]
 
-        sizes: List[int] = []
+        sizes: list[int] = []
         remaining = n
         while remaining > 0:
             if remaining == 4:
@@ -433,7 +1056,6 @@ class DeepSearchOrchestrator:
                 remaining = 0
                 break
             if remaining == 1:
-                # Rebalance to avoid a singleton final group.
                 if sizes:
                     sizes[-1] -= 1
                     sizes.append(2)
@@ -444,16 +1066,34 @@ class DeepSearchOrchestrator:
             sizes.append(3)
             remaining -= 3
 
-        groups: List[List[Dict[str, Any]]] = []
+        groups: list[list[dict[str, Any]]] = []
         cursor = 0
         for size in sizes:
             groups.append(cluster_reports[cursor : cursor + size])
             cursor += size
         return groups
 
-    def get_pool_status(self) -> Dict[str, Any]:
+    @staticmethod
+    def _stitch_synthesis_reports(query: str, synthesis_reports: list[dict[str, Any]]) -> str:
+        if not synthesis_reports:
+            return "No synthesis reports were generated."
+
+        lines: list[str] = ["Report", "", f"Query: {query}", ""]
+        for item in synthesis_reports:
+            group = item.get("group", "?")
+            queries = item.get("queries", [])
+            report = (item.get("report", "") or "").strip()
+            title = f"Synthesis Block {group}"
+            if queries:
+                title += f" ({', '.join(queries)})"
+            lines.append(f"## {title}")
+            lines.append(report or "No report content.")
+            lines.append("")
+        return "\n".join(lines).strip()
+
+    def get_pool_status(self) -> dict[str, Any]:
         return {
             "max_concurrent": self.max_concurrent,
             "available": getattr(self._agent_semaphore, "_value", 0),
-            "mode": "research",
+            "mode": "research-v2",
         }

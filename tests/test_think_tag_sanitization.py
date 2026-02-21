@@ -1,11 +1,3 @@
-import sys
-from pathlib import Path
-
-
-ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT))
-sys.path.insert(0, str(ROOT / "mcp-server"))
-
 from expressindex_cli.main import _sanitize_payload  # noqa: E402
 from reporting import strip_think_blocks  # noqa: E402
 from server import _strip_think_tags  # noqa: E402

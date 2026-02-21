@@ -7,30 +7,29 @@ Provides tiered research capabilities via MCP protocol.
 import asyncio
 import json
 import logging
-import re
+import time
 import uuid
 from typing import Any, Dict
 
 from aiohttp import web
 
 from config import CONFIG, list_llm_models
+from logging_utils import configure_logging
+from request_context import request_id_var
 from search.searxng_client import SearXNGClient
 from search.llm_client import LLMClient
 from agents.quicksearch import PeekAgent, SkimAgent, QuickSearchAgent
 from agents.deepresearch import AnalyzeOrchestrator, DeepSearchOrchestrator
+from telemetry import MetricsRegistry
+from utils.sanitize import strip_think_tags
 
-logging.basicConfig(
-    level=getattr(logging, CONFIG.get('log_level', 'INFO')),
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
+SCHEMA_VERSION = "v2.0"
+configure_logging(CONFIG.get("log_level", "INFO"), CONFIG.get("log_format", "text"))
 logger = logging.getLogger("expressindex-mcp")
 
 
 def _strip_think_tags(text: str) -> str:
-    if not text:
-        return ""
-    cleaned = re.sub(r"<think>[\s\S]*?(</think>|$)", "", text, flags=re.IGNORECASE)
-    return cleaned.strip()
+    return strip_think_tags(text)
 
 
 class MCPRequestHandler:
@@ -41,12 +40,15 @@ class MCPRequestHandler:
             base_url=CONFIG['searxng_url'],
             timeout=CONFIG.get('searxng_timeout', 30)
         )
+        self.searxng.configure_retries(CONFIG.get("searxng_retries", 2), CONFIG.get("http_retry_base_ms", 250))
         
         self.llm = LLMClient(
             api_url=CONFIG['llm_api_url'],
             api_key=CONFIG.get('llm_api_key'),
             model=CONFIG.get('llm_model_id', ''),
-            timeout=CONFIG.get('llm_timeout', 0)
+            timeout=CONFIG.get('llm_timeout', 0),
+            retries=CONFIG.get("llm_retries", 2),
+            retry_base_ms=CONFIG.get("http_retry_base_ms", 250),
         )
 
         self.peek = PeekAgent(
@@ -86,38 +88,103 @@ class MCPRequestHandler:
         )
         
         self.session_id = str(uuid.uuid4())
-        logger.info(f"MCP Server initialized - Session: {self.session_id}")
+        self.metrics = MetricsRegistry()
+        self.query_max_length = int(CONFIG.get("query_max_length", 600))
+        self.tool_timeouts = {
+            "peek": int(CONFIG.get("tool_timeout_peek", 30)),
+            "skim": int(CONFIG.get("tool_timeout_skim", 120)),
+            "analyze": int(CONFIG.get("tool_timeout_analyze", 300)),
+            "research": int(CONFIG.get("tool_timeout_research", 900)),
+        }
+        logger.info("MCP Server initialized", extra={"status": "ok", "method": "boot"})
+
+    @staticmethod
+    def _error_payload(code: int, message: str, error_type: str) -> Dict[str, Any]:
+        return {
+            "error": {
+                "code": code,
+                "message": message,
+                "data": {"type": error_type, "schema_version": SCHEMA_VERSION},
+            }
+        }
+
+    @staticmethod
+    def _classify_exception(exc: Exception) -> tuple[int, str, str]:
+        text = str(exc).lower()
+        if isinstance(exc, asyncio.TimeoutError) or "timeout" in text:
+            return (-32001, "Tool execution timed out", "upstream_timeout")
+        if "api returned" in text or "unavailable" in text or "search error" in text:
+            return (-32002, "Upstream service unavailable", "upstream_unavailable")
+        return (-32603, str(exc), "internal_error")
+
+    async def _run_with_timeout(self, tool_name: str, coro: Any) -> Any:
+        timeout_s = int(self.tool_timeouts.get(tool_name, 0) or 0)
+        if timeout_s <= 0:
+            return await coro
+        return await asyncio.wait_for(coro, timeout=timeout_s)
+
+    @staticmethod
+    def _text_content(payload: Dict[str, Any]) -> Dict[str, Any]:
+        return {
+            "content": [{"type": "text", "text": json.dumps({"schema_version": SCHEMA_VERSION, **payload}, indent=2)}]
+        }
         
-    async def handle_request(self, request: Dict[str, Any]) -> Dict[str, Any]:
+    async def handle_request(self, request: Dict[str, Any], request_id: str = "-") -> Dict[str, Any]:
         """Handle an incoming MCP request."""
-        
+        started_at = time.perf_counter()
         method = request.get('method')
         params = request.get('params', {})
-        
-        logger.info(f"Handling MCP request: {method}")
-        
-        if method == 'initialize':
-            return await self._handle_initialize(params)
-        elif method == 'tools/list':
-            return await self._handle_tools_list()
-        elif method == 'tools/call':
-            return await self._handle_tools_call(params)
-        elif method == 'resources/list':
-            return await self._handle_resources_list()
-        elif method == 'health':
-            return await self._handle_health()
-        else:
-            return {
-                'error': {
-                    'code': -32601,
-                    'message': f'Unknown method: {method}'
-                }
-            }
+
+        logger.info(
+            "Handling MCP request",
+            extra={"method": str(method), "status": "started", "request_id": request_id},
+        )
+        status = 'ok'
+        try:
+            if method == 'initialize':
+                return await self._handle_initialize(params)
+            elif method == 'tools/list':
+                return await self._handle_tools_list()
+            elif method == 'tools/call':
+                tool_result = await self._handle_tools_call(params, request_id=request_id)
+                if 'error' in tool_result:
+                    status = 'error'
+                return tool_result
+            elif method == 'resources/list':
+                return await self._handle_resources_list()
+            elif method == 'health':
+                return await self._handle_health()
+            elif method == 'ready':
+                return await self._handle_ready()
+            elif method == 'metrics':
+                return self._handle_metrics()
+            else:
+                status = 'error'
+                return self._error_payload(-32601, f'Unknown method: {method}', 'unknown_method')
+        except Exception as exc:
+            status = 'error'
+            code, message, error_type = self._classify_exception(exc)
+            logger.error("MCP request failure: %s", exc, exc_info=True)
+            return self._error_payload(code, message, error_type)
+        finally:
+            elapsed_s = time.perf_counter() - started_at
+            self.metrics.record_request(str(method or 'unknown'), status, elapsed_s)
+            logger.info(
+                "MCP request completed",
+                extra={
+                    "method": str(method),
+                    "status": status,
+                    "duration_ms": round(elapsed_s * 1000, 2),
+                    "request_id": request_id,
+                },
+            )
     
     async def _handle_initialize(self, params: Dict) -> Dict:
         """Handle initialize request."""
+        del params
         return {
             'protocolVersion': '2024-11-05',
+            'schemaVersion': SCHEMA_VERSION,
             'capabilities': {
                 'tools': {},
                 'resources': {}
@@ -134,7 +201,7 @@ class MCPRequestHandler:
             'tools': [
                 {
                     'name': 'peek',
-                    'description': 'Fast URL peek (5 default) with optional fetched page content.',
+                    'description': 'Consensus-calibrated retrieval primitive for high-quality source candidates.',
                     'inputSchema': {
                         'type': 'object',
                         'properties': {
@@ -163,7 +230,7 @@ class MCPRequestHandler:
                 },
                 {
                     'name': 'skim',
-                    'description': 'Parallel skim agents gather diversified sources and return per-agent reports.',
+                    'description': 'Citation-first distillation pack with claims and keyed evidence objects.',
                     'inputSchema': {
                         'type': 'object',
                         'properties': {
@@ -182,7 +249,7 @@ class MCPRequestHandler:
                 },
                 {
                     'name': 'analyze',
-                    'description': 'Multi-agent skim + multiple contradiction summaries + unified analyze report.',
+                    'description': 'Adversarial claim-graph adjudication with decision matrix output.',
                     'inputSchema': {
                         'type': 'object',
                         'properties': {
@@ -196,7 +263,7 @@ class MCPRequestHandler:
                 },
                 {
                     'name': 'research',
-                    'description': 'Deep multi-agent research with pair synthesis blocks and final unified report.',
+                    'description': 'Iterative planner-reviewer DAG for deep, budget-aware evidence coverage.',
                     'inputSchema': {
                         'type': 'object',
                         'properties': {
@@ -260,206 +327,228 @@ class MCPRequestHandler:
                         'type': 'object',
                         'properties': {}
                     }
+                },
+                {
+                    'name': 'fetch_url',
+                    'description': 'Fetch markdown-ish content for a specific URL (debug/inspection helper).',
+                    'inputSchema': {
+                        'type': 'object',
+                        'properties': {
+                            'url': {
+                                'type': 'string',
+                                'description': 'Fully-qualified URL to fetch'
+                            },
+                            'max_chars': {
+                                'type': 'integer',
+                                'description': 'Maximum number of returned characters (default: 4000)',
+                                'default': 4000
+                            }
+                        },
+                        'required': ['url']
+                    }
                 }
             ]
         }
     
-    async def _handle_tools_call(self, params: Dict) -> Dict:
+    async def _handle_tools_call(self, params: Dict, request_id: str = "-") -> Dict:
         """Handle tool call request."""
-        
+        started_at = time.perf_counter()
         tool_name = params.get('name')
         arguments = params.get('arguments', {})
+        metric_tool_name = str(tool_name or 'unknown')
+
+        def record_tool(status: str, error_type: str = "") -> None:
+            self.metrics.record_tool(metric_tool_name, status, time.perf_counter() - started_at)
+            log_extra = {
+                "tool": metric_tool_name,
+                "status": status,
+                "duration_ms": round((time.perf_counter() - started_at) * 1000, 2),
+                "request_id": request_id,
+            }
+            if error_type:
+                log_extra["error_type"] = error_type
+            logger.info("Tool execution finished", extra=log_extra)
+
+        if not isinstance(arguments, dict):
+            record_tool('error', 'validation_error')
+            return self._error_payload(-32602, 'Invalid params: arguments must be an object', 'validation_error')
+
+        aliases = {'quicksearch': 'skim', 'deepresearch': 'research'}
+        resolved_tool_name = aliases.get(str(tool_name), str(tool_name))
+        metric_tool_name = resolved_tool_name
+
+        if resolved_tool_name in {'peek', 'skim', 'analyze', 'research'}:
+            query = arguments.get('query')
+            if not isinstance(query, str) or not query.strip():
+                record_tool('error', 'validation_error')
+                return self._error_payload(-32602, 'Invalid params: query must be a non-empty string', 'validation_error')
+
+            if len(query.strip()) > self.query_max_length:
+                record_tool('error', 'validation_error')
+                return self._error_payload(
+                    -32602,
+                    f'Invalid params: query length exceeds max {self.query_max_length}',
+                    'validation_error',
+                )
+
+            if arguments.get("max_results") is not None:
+                max_results = arguments.get("max_results")
+                if not isinstance(max_results, int) or max_results <= 0:
+                    record_tool('error', 'validation_error')
+                    return self._error_payload(-32602, 'Invalid params: max_results must be a positive integer', 'validation_error')
+
+            if resolved_tool_name == "research" and arguments.get("num_sub_queries") is not None:
+                sub_q = arguments.get("num_sub_queries")
+                if not isinstance(sub_q, int) or sub_q <= 0:
+                    record_tool('error', 'validation_error')
+                    return self._error_payload(
+                        -32602, 'Invalid params: num_sub_queries must be a positive integer', 'validation_error'
+                    )
         
-        logger.info(f"Calling tool: {tool_name} with args: {arguments}")
+        logger.info(
+            "Calling tool",
+            extra={
+                "request_id": request_id,
+                "tool": resolved_tool_name,
+                "status": "started",
+            },
+        )
         
         try:
-            if tool_name == 'quicksearch':
-                tool_name = 'skim'
-            if tool_name == 'deepresearch':
-                tool_name = 'research'
-
-            if tool_name == 'peek':
-                result = await self.peek.search(
+            if resolved_tool_name == 'peek':
+                result = await self._run_with_timeout(
+                    "peek",
+                    self.peek.search(
                     query=arguments['query'],
                     max_results=arguments.get('max_results'),
                     fetch_content=arguments.get('fetch_content', True),
                     max_content_chars=arguments.get('max_content_chars', 4000),
+                    ),
                 )
-                return {
-                    'content': [
-                        {
-                            'type': 'text',
-                            'text': json.dumps({
-                                'query': result.query,
-                                'sources': result.results,
-                                'sources_count': result.sources_count,
-                                'search_time': round(result.search_time, 2)
-                            }, indent=2)
-                        }
-                    ]
-                }
+                record_tool('ok')
+                return self._text_content({
+                    'query': result.query,
+                    'sources': result.sources,
+                    '_meta': result.meta,
+                })
 
-            if tool_name == 'skim':
-                result = await self.quicksearch.search(
+            if resolved_tool_name == 'skim':
+                result = await self._run_with_timeout(
+                    "skim",
+                    self.quicksearch.search(
                     query=arguments['query'],
                     max_results=arguments.get('max_results')
+                    ),
                 )
-                safe_report = _strip_think_tags(result.report)
-                skim_reports = [
-                    {
-                        **item,
-                        'report': _strip_think_tags(item.get('report', '')),
-                    }
-                    for item in result.skim_reports
-                ]
-                return {
-                    'content': [
-                        {
-                            'type': 'text',
-                            'text': json.dumps({
-                                'query': result.query,
-                                'report': safe_report,
-                                'skim_reports': skim_reports,
-                                'skim_agent_runs': result.skim_agent_runs,
-                                'sources': result.sources,
-                                'sources_count': result.sources_count,
-                                'search_time': round(result.search_time, 2)
-                            }, indent=2)
-                        }
-                    ]
-                }
+                safe_answer = _strip_think_tags(result.final_answer)
+                record_tool('ok')
+                return self._text_content({
+                    'query': result.query,
+                    'final_answer': safe_answer,
+                    'claims': result.claims,
+                    'key_evidence': result.key_evidence,
+                    'sources': result.sources,
+                    'uncertainties': result.uncertainties,
+                    '_meta': result.meta,
+                })
                 
-            elif tool_name == 'analyze':
-                result = await self.analyze.analyze(
+            elif resolved_tool_name == 'analyze':
+                result = await self._run_with_timeout(
+                    "analyze",
+                    self.analyze.analyze(
                     query=arguments['query']
+                    ),
                 )
-                safe_report = _strip_think_tags(result.report)
-                safe_a = _strip_think_tags(result.report_a)
-                safe_b = _strip_think_tags(result.report_b)
-                safe_agent_reports = [
-                    {
-                        **item,
-                        'report': _strip_think_tags(item.get('report', '')),
-                    }
-                    for item in result.agent_reports
-                ]
-                return {
-                    'content': [
-                        {
-                            'type': 'text',
-                            'text': json.dumps({
-                                'query': result.query,
-                                'report': safe_report,
-                                'agent_a_report': safe_a,
-                                'agent_b_report': safe_b,
-                                'agent_reports': safe_agent_reports,
-                                'agent_count': result.agent_count,
-                                'merge_reports': [
-                                    {
-                                        **item,
-                                        'report': _strip_think_tags(item.get('report', '')),
-                                    }
-                                    for item in result.merge_reports
-                                ],
-                                'merge_agent_count': result.merge_agent_count,
-                                'sources_a': result.sources_a,
-                                'sources_b': result.sources_b,
-                                'search_time': round(result.search_time, 2)
-                            }, indent=2)
-                        }
-                    ]
-                }
+                record_tool('ok')
+                return self._text_content({
+                    'query': result.query,
+                    'query_mode': result.query_mode,
+                    'consensus_claims': result.consensus_claims,
+                    'disputed_claims': result.disputed_claims,
+                    'decision_matrix': result.decision_matrix,
+                    'recommended_position': _strip_think_tags(result.recommended_position),
+                    'sensitivity_factors': result.sensitivity_factors,
+                    'key_evidence': result.key_evidence,
+                    'sources': result.sources,
+                    '_meta': result.meta,
+                })
 
-            elif tool_name == 'research':
-                result = await self.deepresearch.search(
+            elif resolved_tool_name == 'research':
+                result = await self._run_with_timeout(
+                    "research",
+                    self.deepresearch.search(
                     query=arguments['query'],
                     num_sub_queries=arguments.get('num_sub_queries', CONFIG.get('research_max_sub_queries', 6))
+                    ),
                 )
-                cluster_reports = [
-                    {
-                        **item,
-                        'report': _strip_think_tags(item.get('report', '')),
-                    }
-                    for item in result.cluster_reports
-                ]
-                synthesis_reports = [
-                    {
-                        **item,
-                        'report': _strip_think_tags(item.get('report', '')),
-                    }
-                    for item in result.synthesis_reports
-                ]
-                synthesis_count = len(synthesis_reports)
-                return {
-                    'content': [
-                        {
-                            'type': 'text',
-                            'text': json.dumps({
-                                'query': result.query,
-                                'sub_queries': result.sub_queries,
-                                'cluster_reports': cluster_reports,
-                                'synthesis_reports': synthesis_reports,
-                                'agent_runs': result.agent_runs,
-                                'final_report': f"Returned {synthesis_count} reports.",
-                                'total_sources': result.total_sources,
-                                'agents_used': result.agents_used,
-                                'search_time': round(result.search_time, 2)
-                            }, indent=2)
-                        }
-                    ]
-                }
+                record_tool('ok')
+                return self._text_content({
+                    'query': result.query,
+                    'final_synthesis': _strip_think_tags(result.final_synthesis),
+                    'evidence_graph': result.evidence_graph,
+                    'coverage_report': result.coverage_report,
+                    'open_questions': result.open_questions,
+                    'trace_log': result.trace_log,
+                    'key_evidence': result.key_evidence,
+                    'sources': result.sources,
+                    '_meta': result.meta,
+                })
                 
-            elif tool_name == 'search_engines':
-                return {
-                    'content': [
-                        {
-                            'type': 'text',
-                            'text': 'Available engines: google, bing, duckduckgo, wikipedia, youtube, and 240+ more via SearXNG'
-                        }
-                    ]
-                }
+            elif resolved_tool_name == 'search_engines':
+                record_tool('ok')
+                return self._text_content(
+                    {'message': 'Available engines: google, bing, duckduckgo, wikipedia, youtube, and 240+ more via SearXNG'}
+                )
                 
-            elif tool_name == 'agent_status':
+            elif resolved_tool_name == 'agent_status':
                 status = self.deepresearch.get_pool_status()
-                return {
-                    'content': [
-                        {
-                            'type': 'text',
-                            'text': json.dumps(status, indent=2)
-                        }
-                    ]
-                }
+                record_tool('ok')
+                return self._text_content(status)
                 
-            elif tool_name == 'list_models':
+            elif resolved_tool_name == 'list_models':
                 models = await list_llm_models(
                     CONFIG['llm_api_url'],
                     CONFIG.get('llm_api_key')
                 )
-                return {
-                    'content': [
-                        {
-                            'type': 'text',
-                            'text': json.dumps({'models': models, 'api_url': CONFIG['llm_api_url']}, indent=2)
-                        }
-                    ]
-                }
+                record_tool('ok')
+                return self._text_content({'models': models, 'api_url': CONFIG['llm_api_url']})
+
+            elif resolved_tool_name == 'fetch_url':
+                url = arguments.get('url')
+                if not isinstance(url, str) or not url.strip():
+                    record_tool('error', 'validation_error')
+                    return self._error_payload(-32602, 'Invalid params: url must be a non-empty string', 'validation_error')
+                trimmed = url.strip()
+                if not (trimmed.startswith('http://') or trimmed.startswith('https://')):
+                    record_tool('error', 'validation_error')
+                    return self._error_payload(
+                        -32602,
+                        'Invalid params: url must start with http:// or https://',
+                        'validation_error',
+                    )
+
+                max_chars = arguments.get('max_chars', 4000)
+                if not isinstance(max_chars, int) or max_chars <= 0:
+                    record_tool('error', 'validation_error')
+                    return self._error_payload(
+                        -32602,
+                        'Invalid params: max_chars must be a positive integer',
+                        'validation_error',
+                    )
+
+                fetched = await self.searxng.fetch_url_content(trimmed, max_length=min(max_chars, 12000))
+                record_tool('ok')
+                return self._text_content({'url': trimmed, 'fetched_markdown': fetched, 'chars': len(fetched)})
                 
             else:
-                return {
-                    'error': {
-                        'code': -32601,
-                        'message': f'Unknown tool: {tool_name}'
-                    }
-                }
+                record_tool('error', 'unknown_tool')
+                return self._error_payload(-32601, f'Unknown tool: {resolved_tool_name}', 'unknown_tool')
                 
         except Exception as e:
-            logger.error(f"Tool error: {e}", exc_info=True)
-            return {
-                'error': {
-                    'code': -32603,
-                    'message': str(e)
-                }
-            }
+            code, message, error_type = self._classify_exception(e)
+            logger.error("Tool error: %s", e, exc_info=True)
+            record_tool('error', error_type)
+            return self._error_payload(code, message, error_type)
     
     async def _handle_resources_list(self) -> Dict:
         """List available resources."""
@@ -474,6 +563,11 @@ class MCPRequestHandler:
                     'uri': 'config://current',
                     'name': 'Current Configuration',
                     'description': 'Current MCP server configuration'
+                },
+                {
+                    'uri': 'expressindex://metrics',
+                    'name': 'ExpressIndex Metrics',
+                    'description': 'Aggregated request/tool counters and latency summaries'
                 }
             ]
         }
@@ -484,12 +578,37 @@ class MCPRequestHandler:
         llm_health = await self.llm.health_check()
         
         return {
+            'schemaVersion': SCHEMA_VERSION,
             'status': 'healthy' if (searxng_health and llm_health) else 'degraded',
             'services': {
                 'searxng': 'up' if searxng_health else 'down',
                 'llm': 'up' if llm_health else 'down'
             },
             'session': self.session_id
+        }
+
+    async def _handle_ready(self) -> Dict[str, Any]:
+        searxng_health = await self.searxng.health_check()
+        llm_health = await self.llm.health_check()
+        require_llm = bool(CONFIG.get("readiness_require_llm", True))
+
+        ready = searxng_health and (llm_health or not require_llm)
+        return {
+            "schemaVersion": SCHEMA_VERSION,
+            "status": "ready" if ready else "not_ready",
+            "checks": {
+                "searxng": "pass" if searxng_health else "fail",
+                "llm": "pass" if llm_health else ("optional" if not require_llm else "fail"),
+            },
+            "require_llm": require_llm,
+            "session": self.session_id,
+        }
+
+    def _handle_metrics(self) -> Dict[str, Any]:
+        return {
+            'schemaVersion': SCHEMA_VERSION,
+            'session': self.session_id,
+            'metrics': self.metrics.snapshot(),
         }
 
 
@@ -512,19 +631,30 @@ async def main():
     logger.info(f"Active LLM model: {handler.llm.model}")
 
     async def mcp_endpoint(request: web.Request) -> web.Response:
+        started_at = time.perf_counter()
         try:
             payload = await request.json()
         except Exception:
+            handler.metrics.record_request('parse_error', 'error', time.perf_counter() - started_at)
             return web.json_response(
                 {
                     'jsonrpc': '2.0',
-                    'error': {'code': -32700, 'message': 'Parse error'},
+                    'error': {
+                        'code': -32700,
+                        'message': 'Parse error',
+                        'data': {'type': 'parse_error', 'schema_version': SCHEMA_VERSION},
+                    },
                     'id': None,
                 },
                 status=400,
             )
 
-        result = await handler.handle_request(payload)
+        request_id = str(payload.get('id') or uuid.uuid4())
+        token = request_id_var.set(request_id)
+        try:
+            result = await handler.handle_request(payload, request_id=request_id)
+        finally:
+            request_id_var.reset(token)
         response = {'jsonrpc': '2.0', 'id': payload.get('id')}
         if 'error' in result:
             response['error'] = result['error']
@@ -537,9 +667,24 @@ async def main():
         code = 200 if health['status'] == 'healthy' else 503
         return web.json_response(health, status=code)
 
+    async def ready_endpoint(_: web.Request) -> web.Response:
+        readiness = await handler._handle_ready()
+        code = 200 if readiness["status"] == "ready" else 503
+        return web.json_response(readiness, status=code)
+
+    async def metrics_endpoint(_: web.Request) -> web.Response:
+        return web.json_response(handler._handle_metrics())
+
+    async def on_cleanup(_: web.Application) -> None:
+        await handler.searxng.close()
+        await handler.llm.close()
+
     app = web.Application()
     app.router.add_get('/health', health_endpoint)
+    app.router.add_get('/ready', ready_endpoint)
+    app.router.add_get('/metrics', metrics_endpoint)
     app.router.add_post('/mcp', mcp_endpoint)
+    app.on_cleanup.append(on_cleanup)
 
     runner = web.AppRunner(app)
     await runner.setup()

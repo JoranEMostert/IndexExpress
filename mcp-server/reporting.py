@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, List
 
 from search.llm_client import LLMClient
+from utils.sanitize import strip_think_tags
 
 logger = logging.getLogger("reporting")
 
@@ -37,14 +38,22 @@ def dedupe_sources(results: List[Dict[str, Any]], limit: int) -> List[Dict[str, 
 
 
 def strip_think_blocks(text: str) -> str:
-    if not text:
-        return ""
-    cleaned = re.sub(r"<think>[\s\S]*?(</think>|$)", "", text, flags=re.IGNORECASE)
-    return cleaned.strip()
+    return strip_think_tags(text)
 
 
 def has_citations(text: str) -> bool:
     return bool(re.search(r"\(\d+\)", text or ""))
+
+
+def citation_numbers(text: str) -> list[int]:
+    return [int(match) for match in re.findall(r"\((\d+)\)", text or "")]
+
+
+def has_invalid_citations(text: str, max_index: int) -> bool:
+    refs = citation_numbers(text)
+    if not refs:
+        return False
+    return any(num < 1 or num > max_index for num in refs)
 
 
 class ReportGenerator:
@@ -109,6 +118,14 @@ class ReportGenerator:
 
         if not has_citations(report):
             report = await self._repair_citations(query, indexed_sources, report)
+
+        if has_invalid_citations(report, max_index=len(indexed_sources)):
+            logger.warning("Report had out-of-range citations; running repair")
+            report = await self._repair_citations(query, indexed_sources, report)
+
+        if has_invalid_citations(report, max_index=len(indexed_sources)):
+            logger.warning("Citation repair still invalid; falling back")
+            report = self._fallback_report(query, sources)
 
         if not report:
             report = self._fallback_report(query, sources)

@@ -1,12 +1,6 @@
 import asyncio
-import sys
-from pathlib import Path
 
-
-ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT / "mcp-server"))
-
-from reporting import ReportGenerator  # noqa: E402
+from reporting import ReportGenerator, has_invalid_citations  # noqa: E402
 from search.llm_client import LLMResponse  # noqa: E402
 
 
@@ -73,3 +67,8 @@ def test_write_report_uses_fallback_when_all_outputs_are_empty_after_strip():
 
     assert "Summary for 'slug facts':" in result.report
     assert "<think>" not in result.report.lower()
+
+
+def test_has_invalid_citations_detects_out_of_range_indexes():
+    assert has_invalid_citations("Fact (1) and another (3)", max_index=2)
+    assert not has_invalid_citations("Fact (1) and another (2)", max_index=2)

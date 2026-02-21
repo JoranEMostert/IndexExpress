@@ -9,21 +9,21 @@ Privacy-first web research with tiered retrieval/report modes, source-cited outp
 
 ## Feature Labels
 
-- `peek`: 5 URLs, no LLM report
-- `skim`: configurable parallel skim agents returning per-agent reports
-- `analyze`: configurable multi-agent skim passes + multi-merge contradiction synthesis
-- `research`: deep multi-agent flow with pair synthesis blocks (no extra global summarizer)
-- Citation contract: inline `(n)` references + final `Sources` list
+- `peek`: pure link-discovery primitive returning ranked `sources`
+- `skim`: citation-first distillation returning `final_answer`, `claims`, `key_evidence`
+- `analyze`: fact-aware adjudication returning either cited findings (fact mode) or a decision matrix (comparative mode)
+- `research`: iterative planner-reviewer DAG returning `final_synthesis`, `evidence_graph`, and coverage status
+- Citation contract: evidence links by `source_id` / `evidence_id`
 - Output: optional markdown export for reports
 
 ## Tier Matrix
 
 | Tier | Best For | Retrieval | LLM | Output |
 |---|---|---|---|---|
-| `peek` | Quick scanning | 5 URLs | No | Source list |
-| `skim` | Fast grounded answer | Parallel multi-query retrieval | Per-agent report generation | `skim_reports` + aggregate sources |
-| `analyze` | Compare viewpoints | Nx skim (configurable) | Multi-merge synthesis | Contradiction-aware report |
-| `research` | Deep investigation | Multi-query parallel retrieval | Pair synthesis blocks | Comprehensive stitched output |
+| `peek` | Quick evidence frontier | Multi-intent retrieval + calibration | No | `sources` with rank metadata |
+| `skim` | Fast grounded answer | Parallel evidence collection | Claim/evidence distillation | `final_answer`, `claims`, `key_evidence` |
+| `analyze` | Resolve contradictions / score options | Adversarial evidence pass | Decision adjudication | `consensus_claims`, `disputed_claims`, `recommended_position`, optional `decision_matrix` |
+| `research` | Exhaustive investigation | Iterative planner/reviewer loops | Graph synthesis | `evidence_graph`, `coverage_report`, `trace_log` |
 
 ## Architecture
 
@@ -32,14 +32,14 @@ Client (MCP or TUI)
     |
     v
 MCP Server (server.py)
-    |- peek      -> PeekAgent (search-only)
-    |- skim      -> SkimAgent (parallel retrieval + per-agent reports)
-    |- analyze   -> AnalyzeOrchestrator (configurable skim runs + multi-merge)
-    |- research  -> DeepSearchOrchestrator (sub-queries + pair synthesis blocks)
+    |- peek      -> PeekAgent (consensus-calibrated retrieval primitive)
+    |- skim      -> SkimAgent (citation-first distillation pack)
+    |- analyze   -> AnalyzeOrchestrator (adversarial claim adjudication)
+    |- research  -> DeepSearchOrchestrator (iterative planner-reviewer DAG)
     |
     +-- SearXNGClient (retrieval)
     +-- LLMClient (OpenAI-compatible)
-    +-- ReportGenerator (citation-aware reporting)
+    +-- workflow_primitives.py (ranking/evidence/claims primitives)
 ```
 
 ## Quick Start
@@ -52,6 +52,17 @@ cp .env.example .env
 
 2. Set `LLM_MODEL_ID` in `.env` to your loaded LM Studio model ID.
 
+Recommended minimal `.env` for most users:
+
+```bash
+LLM_API_URL=http://localhost:1234/v1
+LLM_MODEL_ID=<your-model-id>
+LLM_MAX_PARALLEL=4
+SEARXNG_URL=http://localhost:8888
+```
+
+Everything else in `.env.example` is optional tuning.
+
 3. Build and start backend services:
 
 ```bash
@@ -62,8 +73,12 @@ docker compose up -d --build
 
 ```bash
 curl http://localhost:8000/health
+curl http://localhost:8000/ready
+curl http://localhost:8000/metrics
 curl http://localhost:8888/healthz
 ```
+
+`/ready` is a stricter readiness gate for deploy checks, and `/metrics` returns request/tool counters with latency aggregates.
 
 ## MCP Tools
 
@@ -73,6 +88,7 @@ Primary tools:
 - `skim`
 - `analyze`
 - `research`
+- `fetch_url` (raw page fetch helper for URL inspection)
 
 Backward-compatible aliases:
 
@@ -106,6 +122,42 @@ expressindex peek "what is searxng"
 expressindex skim "fun facts about slugs" --save-md report.md
 expressindex analyze "best python web framework" --save-md compare.md
 expressindex research "vacation plan to aruba" --num-sub-queries 6 --save-md aruba.md
+expressindex status
+expressindex metrics --json
+```
+
+All terminal activations (all search modes + URL fetch helper):
+
+```bash
+# Search modes (CLI)
+expressindex peek "slug facts"
+expressindex skim "slug facts"
+expressindex analyze "slug facts"
+expressindex research "slug facts" --num-sub-queries 6
+
+# URL fetch helper (MCP tool)
+curl -sS http://localhost:8000/mcp \
+  -H "Content-Type: application/json" \
+  -d '{
+    "jsonrpc": "2.0",
+    "id": 1,
+    "method": "tools/call",
+    "params": {
+      "name": "fetch_url",
+      "arguments": {
+        "url": "https://en.wikipedia.org/wiki/Slug",
+        "max_chars": 4000
+      }
+    }
+  }'
+```
+
+Direct mode output formats:
+
+```bash
+expressindex skim "fun facts" --output text
+expressindex skim "fun facts" --output json
+expressindex skim "fun facts" --output markdown
 ```
 
 UI goals:
@@ -117,45 +169,54 @@ UI goals:
 
 ## Report Contract
 
-LLM-backed modes (`skim`, `analyze`, `research`) are expected to output:
+All query tools now return strict MCP-first JSON with shared primitives:
 
-- `Report` body
-- inline citations like `(1)`, `(2)`
-- final `Sources` section with indexed URLs
-- sanitized output with no leaked `<think>...</think>` blocks
+- `sources[]`: `{source_id, url, title, domain, relevance_score, domain_trust_score, freshness_timestamp, intent_category}`
+- `key_evidence[]`: `{evidence_id, source_id, exact_quote, relevance_score}`
+- `claims[]`: `{claim_id, statement, support_evidence_ids, refute_evidence_ids, confidence_tier}`
+- `_meta`: `{token_estimate, compute_ms, schema_version}`
 
-`skim` response specifics:
+Mode-specific outputs:
 
-- primary deliverable is `skim_reports` (one report per skim agent)
-- top-level `report` is a status string like `Returned N skim reports.`
-
-`research` response specifics:
-
-- primary deliverable is `synthesis_reports` (grouped synthesis outputs)
-- `final_report` is a status string indicating how many synthesis reports were returned
+- `peek`: `query`, `sources`, `_meta`
+- `skim`: `final_answer`, `claims`, `uncertainties`
+- `analyze`: `query_mode`, `consensus_claims`, `disputed_claims`, `recommended_position`, `sensitivity_factors`, optional `decision_matrix`
+- `research`: `final_synthesis`, `evidence_graph`, `coverage_report`, `open_questions`, `trace_log`
 
 ## Environment Variables
 
+If the full table feels too configurable, use the 4-variable minimal config above and keep defaults for the rest.
+
 | Variable | Purpose | Default |
 |---|---|---|
-| `LLM_API_URL` | OpenAI-compatible base URL | `http://host.docker.internal:1234/v1` |
+| `LLM_API_URL` | OpenAI-compatible base URL | `http://localhost:1234/v1` |
 | `LLM_API_KEY` | Optional API key | empty |
 | `LLM_MODEL_ID` | Active model ID | `local-model` |
 | `LLM_MODEL` | Legacy alias for model ID (used when `LLM_MODEL_ID` is empty) | empty |
 | `LLM_TIMEOUT` | LLM timeout (`0` = no timeout) | `0` |
 | `LLM_MAX_PARALLEL` | Max concurrent LLM calls | `4` |
+| `LLM_RETRIES` | Retry attempts for transient LLM failures | `2` |
 | `SEARXNG_URL` | SearXNG endpoint | `http://searxng:8080` |
 | `SEARXNG_TIMEOUT` | Search timeout (`0` = no timeout) | `0` |
+| `SEARXNG_RETRIES` | Retry attempts for transient search failures | `2` |
 | `PEEK_MAX_URLS` | Default max URLs for `peek` | `5` |
 | `SKIM_MAX_URLS` | Default max URLs for `skim` | `15` |
 | `SKIM_AGENT_COUNT` | Parallel skim retrieval agents | `1` |
 | `ANALYZE_SOURCES_PER_AGENT` | Sources per analyze agent | `12` |
-| `ANALYZE_AGENT_COUNT` | Number of analyze agents/reports to merge | `2` |
-| `ANALYZE_CONTRADICTION_AGENTS` | Number of parallel contradiction merge agents (`0` = auto) | `0` |
+| `ANALYZE_AGENT_COUNT` | Number of analyze retrieval variants | `2` |
+| `ANALYZE_CONTRADICTION_AGENTS` | Compatibility knob for legacy analyze paths | `0` |
 | `RESEARCH_MAX_SUB_QUERIES` | Research sub-queries (blank = inherit `MAX_CONCURRENT_AGENTS`) | inherited |
 | `RESEARCH_SOURCES_PER_SUB_QUERY` | Sources per research sub-query | `8` |
 | `MAX_CONCURRENT_AGENTS` | Parallel research workers | `7` |
+| `QUERY_MAX_LENGTH` | Maximum accepted query length | `600` |
+| `READINESS_REQUIRE_LLM` | Require LLM health for `/ready` | `true` |
+| `TOOL_TIMEOUT_PEEK` | Max seconds for `peek` tool execution (`0` disables timeout) | `30` |
+| `TOOL_TIMEOUT_SKIM` | Max seconds for `skim` tool execution (`0` disables timeout) | `120` |
+| `TOOL_TIMEOUT_ANALYZE` | Max seconds for `analyze` tool execution (`0` disables timeout) | `300` |
+| `TOOL_TIMEOUT_RESEARCH` | Max seconds for `research` tool execution (`0` disables timeout) | `900` |
+| `HTTP_RETRY_BASE_MS` | Base delay for exponential retry backoff | `250` |
 | `LOG_LEVEL` | Logging level | `INFO` |
+| `LOG_FORMAT` | `text` or structured `json` logs | `text` |
 
 Legacy alias still supported:
 

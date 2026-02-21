@@ -2,13 +2,13 @@
 import argparse
 import asyncio
 import json
-import re
 import sys
 import time
 from itertools import cycle
 from typing import Any, Dict, Optional
 
 import aiohttp
+from utils.sanitize import sanitize_payload
 
 
 def parse_args() -> argparse.Namespace:
@@ -45,34 +45,6 @@ async def spinner(message: str, done_event: asyncio.Event) -> None:
         await asyncio.sleep(0.12)
     sys.stdout.write("\r")
     sys.stdout.flush()
-
-
-def strip_think_tags(text: str) -> str:
-    if not text:
-        return ""
-    cleaned = re.sub(r"<think>[\s\S]*?(</think>|$)", "", text, flags=re.IGNORECASE)
-    return cleaned.strip()
-
-
-def sanitize_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
-    cleaned = dict(payload)
-    for key in ("report", "final_report", "agent_a_report", "agent_b_report"):
-        if isinstance(cleaned.get(key), str):
-            cleaned[key] = strip_think_tags(cleaned[key])
-    for list_key in ("cluster_reports", "synthesis_reports", "merge_reports", "skim_reports"):
-        rows = cleaned.get(list_key)
-        if isinstance(rows, list):
-            patched = []
-            for item in rows:
-                if isinstance(item, dict):
-                    row = dict(item)
-                    if isinstance(row.get("report"), str):
-                        row["report"] = strip_think_tags(row["report"])
-                    patched.append(row)
-                else:
-                    patched.append(item)
-            cleaned[list_key] = patched
-    return cleaned
 
 
 async def call_tool(

@@ -2,11 +2,23 @@ import asyncio
 import logging
 import time
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
+from typing import Any, Optional
+from urllib.parse import urlparse
 
-from reporting import ReportGenerator, dedupe_sources
+from reporting import dedupe_sources
 from search.llm_client import LLMClient
 from search.searxng_client import SearXNGClient
+from workflow_primitives import (
+    build_meta,
+    cited_bullet_summary,
+    classify_query_intent,
+    make_claim_primitives,
+    make_evidence_primitives,
+    make_source_primitives,
+    normalize_url,
+    rank_sources,
+    split_consensus_disputed,
+)
 
 logger = logging.getLogger("quicksearch")
 
@@ -14,20 +26,127 @@ logger = logging.getLogger("quicksearch")
 @dataclass
 class PeekResult:
     query: str
-    results: List[Dict[str, str]]
-    sources_count: int
+    sources: list[dict[str, Any]]
+    meta: dict[str, Any]
     search_time: float
 
 
 @dataclass
 class SkimResult:
     query: str
-    report: str
-    sources: List[Dict[str, str]]
-    skim_reports: List[Dict[str, Any]]
-    skim_agent_runs: List[Dict[str, Any]]
-    sources_count: int
+    final_answer: str
+    claims: list[dict[str, Any]]
+    key_evidence: list[dict[str, Any]]
+    sources: list[dict[str, Any]]
+    uncertainties: list[str]
+    meta: dict[str, Any]
     search_time: float
+
+
+def _pick_peek_queries(query: str, intent: str) -> list[str]:
+    if intent == "academic":
+        return [query, f"{query} paper", f"{query} systematic review", f"{query} evidence"]
+    if intent == "news":
+        return [query, f"{query} latest", f"{query} analysis", f"{query} timeline"]
+    if intent == "documentation":
+        return [query, f"{query} documentation", f"{query} api reference", f"{query} examples"]
+    return [query, f"{query} overview", f"{query} evidence", f"{query} expert sources"]
+
+
+def _normalized_host(url: str) -> str:
+    host = urlparse(url or "").netloc.lower()
+    if host.startswith("www."):
+        return host[4:]
+    return host
+
+
+def _peek_base_score(row: dict[str, Any]) -> float:
+    relevance = float(row.get("_relevance", 0.0))
+    trust = float(row.get("_trust", 0.0))
+    quality = float(row.get("_quality", 0.0))
+    freshness = float(row.get("_freshness", 0.0))
+    score = float(row.get("_score", 0.0))
+    return (
+        (0.52 * relevance)
+        + (0.24 * trust)
+        + (0.12 * quality)
+        + (0.08 * freshness)
+        + (0.04 * score)
+    )
+
+
+def _rerank_for_diversity(ranked_rows: list[dict[str, Any]], target: int) -> list[dict[str, Any]]:
+    if target <= 0 or not ranked_rows:
+        return []
+
+    scored_rows: list[tuple[dict[str, Any], str, float]] = []
+    for row in ranked_rows:
+        base_score = _peek_base_score(row)
+        if base_score <= 0:
+            continue
+        scored_rows.append((row, _normalized_host(row.get("url", "")), base_score))
+
+    if not scored_rows:
+        return ranked_rows[:target]
+
+    scored_rows.sort(key=lambda item: (item[2], float(item[0].get("_score", 0.0))), reverse=True)
+
+    selected: list[dict[str, Any]] = []
+    selected_keys: set[str] = set()
+    host_counts: dict[str, int] = {}
+    deferred: list[tuple[dict[str, Any], str, float]] = []
+
+    for row, host, base_score in scored_rows:
+        if len(selected) >= target:
+            break
+        key = normalize_url(row.get("url", ""))
+        if key in selected_keys:
+            continue
+        if host and host_counts.get(host, 0) == 0:
+            selected.append(row)
+            selected_keys.add(key)
+            host_counts[host] = 1
+            continue
+        deferred.append((row, host, base_score))
+
+    if len(selected) < target:
+        deferred.sort(
+            key=lambda item: item[2] / (1.0 + (host_counts.get(item[1], 0) * 1.1)),
+            reverse=True,
+        )
+        for row, host, _ in deferred:
+            if len(selected) >= target:
+                break
+            key = normalize_url(row.get("url", ""))
+            if key in selected_keys:
+                continue
+            if host and host_counts.get(host, 0) >= 2:
+                continue
+            selected.append(row)
+            selected_keys.add(key)
+            if host:
+                host_counts[host] = host_counts.get(host, 0) + 1
+
+    if len(selected) < target:
+        for row, _, _ in scored_rows:
+            if len(selected) >= target:
+                break
+            key = normalize_url(row.get("url", ""))
+            if key in selected_keys:
+                continue
+            selected.append(row)
+            selected_keys.add(key)
+
+    return selected[:target]
+
+
+def _source_url_map(ranked_rows: list[dict[str, Any]], source_primitives: list[dict[str, Any]]) -> dict[str, str]:
+    out: dict[str, str] = {}
+    for idx, row in enumerate(ranked_rows, start=1):
+        if idx - 1 >= len(source_primitives):
+            break
+        out[row.get("url", "")] = source_primitives[idx - 1]["source_id"]
+    return out
 
 
 class PeekAgent:
@@ -42,45 +161,54 @@ class PeekAgent:
         fetch_content: bool = True,
         max_content_chars: int = 4000,
     ) -> PeekResult:
-        start_time = time.time()
+        started_at = time.perf_counter()
         target = max(1, min(max_results or self.max_urls, 20))
-        logger.info("Peek: query=%s max_results=%s fetch_content=%s", query, target, fetch_content)
+        intent = classify_query_intent(query)
+        peek_queries = _pick_peek_queries(query, intent)
 
-        search_results = await self.searxng.search(query=query, max_results=target * 3, strict=True)
-        unique = dedupe_sources(
-            [
-                {
-                    "url": r.url,
-                    "title": r.title,
-                    "content": r.content,
-                    "engine": r.engine,
-                }
-                for r in search_results
-            ],
-            limit=target,
-        )
+        logger.info("Peek v2: query=%s target=%s intent=%s", query, target, intent)
 
-        if fetch_content:
-            unique = await self.searxng.enrich_sources_with_content(
-                unique,
+        async def run_variant(variant: str) -> list[Any]:
+            return await self.searxng.search(query=variant, max_results=target * 4, strict=False)
+
+        batches = await asyncio.gather(*[run_variant(item) for item in peek_queries])
+        candidates = [
+            {
+                "url": result.url,
+                "title": result.title,
+                "content": result.content,
+                "engine": result.engine,
+            }
+            for batch in batches
+            for result in batch
+        ]
+        candidates = dedupe_sources(candidates, limit=max(target * 8, 24))
+
+        if fetch_content and candidates:
+            enrich_limit = min(len(candidates), max(target + 2, 6))
+            enriched = await self.searxng.enrich_sources_with_content(
+                candidates[:enrich_limit],
                 max_length=max_content_chars,
                 max_parallel=6,
             )
+            candidates = enriched + candidates[enrich_limit:]
+
+        ranking_pool_target = min(len(candidates), max(target * 4, 16))
+        ranked_rows = rank_sources(query, candidates, ranking_pool_target, intent)
+        selected_rows = _rerank_for_diversity(ranked_rows, target)
+        source_primitives = make_source_primitives(selected_rows)
+
+        payload = {
+            "query": query,
+            "sources": source_primitives,
+        }
+        payload["_meta"] = build_meta(started_at, payload)
 
         return PeekResult(
             query=query,
-            results=[
-                {
-                    "url": item["url"],
-                    "title": item["title"],
-                    "content": item.get("content", ""),
-                    "fetched_markdown": item.get("fetched_markdown", ""),
-                    "engine": item.get("engine", "unknown"),
-                }
-                for item in unique
-            ],
-            sources_count=len(unique),
-            search_time=time.time() - start_time,
+            sources=source_primitives,
+            meta=payload["_meta"],
+            search_time=time.perf_counter() - started_at,
         )
 
 
@@ -96,7 +224,6 @@ class SkimAgent:
         self.llm = llm_client
         self.max_urls = max_urls
         self.agent_count = max(1, agent_count)
-        self.reporter = ReportGenerator(llm_client)
 
     async def search_and_report(
         self,
@@ -104,142 +231,101 @@ class SkimAgent:
         max_results: Optional[int] = None,
         exclude_urls: Optional[set[str]] = None,
     ) -> SkimResult:
-        start_time = time.time()
-        target = max(1, min(max_results or self.max_urls, 20))
-        logger.info("Skim: query=%s max_results=%s agents=%s", query, target, self.agent_count)
-
+        started_at = time.perf_counter()
+        target = max(1, min(max_results or self.max_urls, 24))
+        intent = classify_query_intent(query)
         skim_queries = self._build_skim_queries(query, self.agent_count)
+        excluded = {normalize_url(url) for url in (exclude_urls or set()) if url}
 
-        async def run_skim_query(q: str) -> List[Any]:
-            return await self.searxng.search(query=q, max_results=target * 4, strict=True)
+        logger.info(
+            "Skim v2: query=%s target=%s agents=%s intent=%s",
+            query,
+            target,
+            self.agent_count,
+            intent,
+        )
 
-        search_batches = await asyncio.gather(*[run_skim_query(q) for q in skim_queries])
+        async def run_variant(variant: str) -> list[Any]:
+            return await self.searxng.search(query=variant, max_results=target * 4, strict=False)
 
-        excluded = set(exclude_urls or set())
-
-        # First pass: allocate mostly-distinct URLs per skim agent.
-        allocated_sources: List[List[Dict[str, Any]]] = []
-        used_urls: set[str] = set()
-        for batch in search_batches:
-            candidate_rows: List[Dict[str, Any]] = []
+        batches = await asyncio.gather(*[run_variant(item) for item in skim_queries])
+        candidates: list[dict[str, Any]] = []
+        for variant_idx, batch in enumerate(batches):
+            variant_query = skim_queries[variant_idx]
             for item in batch:
-                row = {
-                    "url": item.url,
-                    "title": item.title,
-                    "content": item.content,
-                    "engine": item.engine,
-                }
-                normalized = row["url"].strip().lower().rstrip("/")
-                if not normalized or normalized in excluded:
+                key = normalize_url(item.url)
+                if not key or key in excluded:
                     continue
-                candidate_rows.append(row)
+                candidates.append(
+                    {
+                        "url": item.url,
+                        "title": item.title,
+                        "content": item.content,
+                        "engine": item.engine,
+                        "query_origin": variant_query,
+                    }
+                )
 
-            deduped_candidates = dedupe_sources(candidate_rows, limit=target * 3)
-            unique_for_agent: List[Dict[str, Any]] = []
-            for src in deduped_candidates:
-                normalized = src.get("url", "").strip().lower().rstrip("/")
-                if not normalized or normalized in used_urls:
-                    continue
-                unique_for_agent.append(src)
-                used_urls.add(normalized)
-                if len(unique_for_agent) >= target:
-                    break
-            allocated_sources.append(unique_for_agent)
-
-        async def run_agent_report(agent_idx: int, agent_query: str, unique_sources: List[Dict[str, Any]]) -> Dict[str, Any]:
-            started = time.time()
-            if not unique_sources:
-                return {
-                    "agent": agent_idx,
-                    "query": agent_query,
-                    "report": "No unique sources collected for this skim agent.",
-                    "sources": [],
-                    "sources_count": 0,
-                    "run": {
-                        "agent": agent_idx,
-                        "query": agent_query,
-                        "status": "empty",
-                        "duration_s": round(time.time() - started, 2),
-                    },
-                }
-
-            fetched = await self.searxng.enrich_sources_with_content(
-                unique_sources,
+        candidates = dedupe_sources(candidates, limit=max(target * self.agent_count * 3, 30))
+        if candidates:
+            candidates = await self.searxng.enrich_sources_with_content(
+                candidates,
                 max_length=5000,
                 max_parallel=6,
             )
 
-            enriched_sources = []
-            for source in fetched:
-                merged = dict(source)
-                page_text = (source.get("fetched_markdown") or "").strip()
-                if page_text:
-                    merged["content"] = page_text
-                enriched_sources.append(merged)
+        ranked_rows = rank_sources(query, candidates, target * self.agent_count, intent)
+        source_primitives = make_source_primitives(ranked_rows)
+        evidence_rows = make_evidence_primitives(query, ranked_rows)
+        claims = make_claim_primitives(evidence_rows, max_claims=max(12, target))
+        consensus_claims, disputed_claims = split_consensus_disputed(claims)
+        ordered_claims = consensus_claims + disputed_claims
+        final_answer = cited_bullet_summary(query, ordered_claims, evidence_rows, max_lines=5)
 
-            report = await self.reporter.write_report(
-                query=agent_query,
-                sources=enriched_sources,
-                style="concise but complete",
-            )
-            return {
-                "agent": agent_idx,
-                "query": agent_query,
-                "report": report.report,
-                "sources": report.sources,
-                "sources_count": len(unique_sources),
-                "run": {
-                    "agent": agent_idx,
-                    "query": agent_query,
-                    "status": "ok",
-                    "duration_s": round(time.time() - started, 2),
-                },
-            }
+        uncertainties: list[str] = []
+        coverage_floor = min(target, 5)
+        if len(source_primitives) < coverage_floor:
+            uncertainties.append("Coverage is lower than requested max_results target.")
+        if disputed_claims:
+            uncertainties.append("Conflicting evidence detected for one or more claims.")
+        if not evidence_rows:
+            uncertainties.append("No extractable high-relevance quotes were found in fetched content.")
 
-        tasks = [
-            asyncio.create_task(run_agent_report(idx + 1, skim_queries[idx], allocated_sources[idx]))
-            for idx in range(len(skim_queries))
-        ]
-        skim_reports = await asyncio.gather(*tasks)
-
-        aggregate_sources: List[Dict[str, Any]] = []
-        skim_agent_runs: List[Dict[str, Any]] = []
-        for item in skim_reports:
-            aggregate_sources.extend(item.get("sources", []))
-            run_meta = item.get("run")
-            if isinstance(run_meta, dict):
-                skim_agent_runs.append(run_meta)
-
-        deduped_aggregate = dedupe_sources(aggregate_sources, limit=max(20, target * self.agent_count))
-        if self.agent_count == 1 and skim_reports:
-            summary_report = skim_reports[0].get("report", "")
-        else:
-            summary_report = f"Returned {len(skim_reports)} skim reports."
+        payload = {
+            "query": query,
+            "final_answer": final_answer,
+            "claims": ordered_claims,
+            "key_evidence": evidence_rows,
+            "sources": source_primitives,
+            "uncertainties": uncertainties,
+        }
+        payload["_meta"] = build_meta(started_at, payload)
 
         return SkimResult(
             query=query,
-            report=summary_report,
-            sources=deduped_aggregate,
-            skim_reports=skim_reports,
-            skim_agent_runs=skim_agent_runs,
-            sources_count=len(deduped_aggregate),
-            search_time=time.time() - start_time,
+            final_answer=final_answer,
+            claims=ordered_claims,
+            key_evidence=evidence_rows,
+            sources=source_primitives,
+            uncertainties=uncertainties,
+            meta=payload["_meta"],
+            search_time=time.perf_counter() - started_at,
         )
 
     @staticmethod
-    def _build_skim_queries(query: str, count: int) -> List[str]:
+    def _build_skim_queries(query: str, count: int) -> list[str]:
         templates = [
             "{q}",
             "{q} overview",
-            "{q} practical guide",
-            "{q} evidence",
-            "{q} expert sources",
-            "{q} recent developments",
+            "{q} risks",
+            "{q} counterarguments",
+            "{q} implementation",
+            "{q} expert analysis",
             "{q} case studies",
             "{q} misconceptions",
         ]
-        built: List[str] = []
-        for idx in range(count):
+        built: list[str] = []
+        for idx in range(max(1, count)):
             if idx < len(templates):
                 built.append(templates[idx].format(q=query))
             else:
@@ -261,34 +347,58 @@ class QuickSearchAgent(SkimAgent):
 
 
 class QuickSearchSubAgent:
-    """Lightweight search-only sub-agent for deep/research pipelines."""
+    """Lightweight search sub-agent used by deep/research pipelines."""
 
     def __init__(self, searxng_client: SearXNGClient, max_urls: int = 8):
         self.searxng = searxng_client
         self.max_urls = max_urls
 
-    async def search_lightweight(self, query: str, max_results: int = 8) -> Dict[str, Any]:
+    async def search_lightweight(self, query: str, max_results: int = 8) -> dict[str, Any]:
+        started_at = time.perf_counter()
         target = max(1, min(max_results, self.max_urls))
-        search_results = await self.searxng.search(query=query, max_results=target * 3)
-        unique = dedupe_sources(
+        intent = classify_query_intent(query)
+        batch = await self.searxng.search(query=query, max_results=target * 4, strict=False)
+        candidates = dedupe_sources(
             [
                 {
-                    "url": r.url,
-                    "title": r.title,
-                    "content": r.content[:350] if r.content else "",
-                    "engine": r.engine,
+                    "url": item.url,
+                    "title": item.title,
+                    "content": item.content,
+                    "engine": item.engine,
                 }
-                for r in search_results
+                for item in batch
             ],
-            limit=target,
+            limit=max(target * 3, 12),
         )
-        fetched = await self.searxng.enrich_sources_with_content(
-            unique,
-            max_length=3500,
-            max_parallel=4,
-        )
-        for source in fetched:
-            page_text = (source.get("fetched_markdown") or "").strip()
-            if page_text:
-                source["content"] = page_text[:1200]
-        return {"query": query, "results": fetched, "count": len(fetched)}
+        if candidates:
+            candidates = await self.searxng.enrich_sources_with_content(
+                candidates,
+                max_length=3500,
+                max_parallel=4,
+            )
+        ranked_rows = rank_sources(query, candidates, target, intent)
+        source_primitives = make_source_primitives(ranked_rows)
+        url_to_source_id = _source_url_map(ranked_rows, source_primitives)
+
+        results = []
+        for row in ranked_rows:
+            results.append(
+                {
+                    "url": row.get("url", ""),
+                    "title": row.get("title", ""),
+                    "content": (row.get("fetched_markdown") or row.get("content") or "")[:1600],
+                    "engine": row.get("engine", "unknown"),
+                    "source_id": url_to_source_id.get(row.get("url", ""), "src_00"),
+                }
+            )
+
+        return {
+            "query": query,
+            "results": results,
+            "sources": source_primitives,
+            "count": len(results),
+            "_meta": {
+                "duration_s": round(time.perf_counter() - started_at, 3),
+                "intent": intent,
+            },
+        }

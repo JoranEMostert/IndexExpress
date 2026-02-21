@@ -1,13 +1,14 @@
 import argparse
 import asyncio
 import json
-import re
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
+from urllib.parse import urlsplit
 
 import aiohttp
+from expressindex_core.sanitize import sanitize_payload
 from prompt_toolkit import PromptSession
 from prompt_toolkit.patch_stdout import patch_stdout
 from rich.console import Console
@@ -16,37 +17,13 @@ from rich.table import Table
 
 
 MCP_URL_DEFAULT = "http://localhost:8000/mcp"
-MODES = ["peek", "skim", "analyze", "research"]
-
-
-def _strip_think_tags(text: str) -> str:
-    if not text:
-        return ""
-    cleaned = re.sub(r"<think>[\s\S]*?(</think>|$)", "", text, flags=re.IGNORECASE)
-    return cleaned.strip()
+QUERY_MODES = ["peek", "skim", "analyze", "research"]
+UTILITY_MODES = ["status", "metrics"]
+MODES = QUERY_MODES + UTILITY_MODES
 
 
 def _sanitize_payload(payload: dict[str, Any]) -> dict[str, Any]:
-    sanitized = dict(payload)
-    for key in ("report", "final_report", "agent_a_report", "agent_b_report"):
-        if key in sanitized and isinstance(sanitized[key], str):
-            sanitized[key] = _strip_think_tags(sanitized[key])
-
-    for list_key in ("cluster_reports", "synthesis_reports", "merge_reports", "skim_reports"):
-        report_rows = sanitized.get(list_key)
-        if isinstance(report_rows, list):
-            patched = []
-            for item in report_rows:
-                if isinstance(item, dict):
-                    row = dict(item)
-                    if isinstance(row.get("report"), str):
-                        row["report"] = _strip_think_tags(row["report"])
-                    patched.append(row)
-                else:
-                    patched.append(item)
-            sanitized[list_key] = patched
-
-    return sanitized
+    return sanitize_payload(payload)
 
 
 @dataclass
@@ -127,9 +104,94 @@ async def call_agent_status(mcp_url: str) -> dict[str, Any]:
         return {}
 
 
+def _http_base_from_mcp(mcp_url: str) -> str:
+    parts = urlsplit(mcp_url)
+    if not parts.scheme or not parts.netloc:
+        raise RuntimeError(f"Invalid MCP URL: {mcp_url}")
+    return f"{parts.scheme}://{parts.netloc}"
+
+
+async def call_http_json(url: str, timeout_s: int = 10) -> dict[str, Any]:
+    async with aiohttp.ClientSession() as session:
+        async with session.get(url, timeout=aiohttp.ClientTimeout(total=timeout_s)) as response:
+            raw = await response.text()
+            if response.status not in {200, 503}:
+                raise RuntimeError(f"GET {url} failed ({response.status}): {raw}")
+            try:
+                return json.loads(raw)
+            except json.JSONDecodeError as exc:
+                raise RuntimeError(f"Invalid JSON from {url}: {exc}") from exc
+
+
+async def call_status_bundle(mcp_url: str) -> dict[str, Any]:
+    base = _http_base_from_mcp(mcp_url)
+    health, ready, agent = await asyncio.gather(
+        call_http_json(f"{base}/health", timeout_s=10),
+        call_http_json(f"{base}/ready", timeout_s=10),
+        call_agent_status(mcp_url),
+    )
+    return {"health": health, "ready": ready, "agent_status": agent}
+
+
+async def call_metrics(mcp_url: str) -> dict[str, Any]:
+    base = _http_base_from_mcp(mcp_url)
+    return await call_http_json(f"{base}/metrics", timeout_s=10)
+
+
+def _render_status_text(bundle: dict[str, Any]) -> str:
+    health = bundle.get("health", {})
+    ready = bundle.get("ready", {})
+    agent = bundle.get("agent_status", {})
+    max_concurrent = int(agent.get("max_concurrent", 0) or 0)
+    available = int(agent.get("available", 0) or 0)
+    active = max(0, max_concurrent - available)
+    lines = [
+        "ExpressIndex Status",
+        "-------------------",
+        f"health: {health.get('status', 'unknown')}",
+        f"ready: {ready.get('status', 'unknown')}",
+        f"searxng: {health.get('services', {}).get('searxng', 'unknown')}",
+        f"llm: {health.get('services', {}).get('llm', 'unknown')}",
+        f"agents: {active}/{max_concurrent} active",
+    ]
+    return "\n".join(lines)
+
+
+def _render_metrics_text(metrics_payload: dict[str, Any]) -> str:
+    metrics = metrics_payload.get("metrics", {})
+    lines = [
+        "ExpressIndex Metrics",
+        "--------------------",
+        f"uptime_s: {metrics.get('uptime_s', 0)}",
+        "",
+        "Tool Stats:",
+    ]
+    for tool, row in metrics.get("tools", {}).items():
+        lines.append(
+            f"- {tool}: count={row.get('count', 0)} errors={row.get('errors', 0)} "
+            f"avg_s={row.get('avg_s', 0)} max_s={row.get('max_s', 0)}"
+        )
+
+    lines.append("")
+    lines.append("Request Stats:")
+    for method, row in metrics.get("requests", {}).items():
+        lines.append(
+            f"- {method}: count={row.get('count', 0)} errors={row.get('errors', 0)} "
+            f"avg_s={row.get('avg_s', 0)} max_s={row.get('max_s', 0)}"
+        )
+    return "\n".join(lines)
+
+
 def markdown_from_result(query: str, mode: str, payload: dict[str, Any]) -> str:
     lines = [f"# ExpressIndex {mode.title()} Report", "", f"Query: {query}", ""]
-    report = _tui_consumer_summary(mode, payload) or payload.get("report") or payload.get("final_report")
+    report = (
+        _tui_consumer_summary(mode, payload)
+        or payload.get("final_answer")
+        or payload.get("recommended_position")
+        or payload.get("final_synthesis")
+        or payload.get("report")
+        or payload.get("final_report")
+    )
     if report:
         lines.append(report)
     else:
@@ -139,7 +201,17 @@ def markdown_from_result(query: str, mode: str, payload: dict[str, Any]) -> str:
             url = src.get("url", "")
             lines.append(f"{i}. [{title}]({url})")
 
-    if payload.get("search_time") is not None:
+    meta = payload.get("_meta", {})
+    if isinstance(meta, dict):
+        compute_ms = meta.get("compute_ms")
+        token_estimate = meta.get("token_estimate")
+        if compute_ms is not None or token_estimate is not None:
+            lines.append("")
+        if compute_ms is not None:
+            lines.append(f"Compute time: {compute_ms}ms")
+        if token_estimate is not None:
+            lines.append(f"Token estimate: {token_estimate}")
+    elif payload.get("search_time") is not None:
         lines.extend(["", f"Search time: {payload['search_time']}s"])
     return "\n".join(lines)
 
@@ -154,6 +226,15 @@ def _source_lines(payload: dict[str, Any]) -> list[str]:
 
 def _detail_lines(mode: str, payload: dict[str, Any]) -> list[str]:
     if mode == "skim":
+        if "claims" in payload:
+            lines = [
+                f"claims: {len(payload.get('claims', []))}",
+                f"key_evidence: {len(payload.get('key_evidence', []))}",
+                f"sources: {len(payload.get('sources', []))}",
+            ]
+            for item in payload.get("uncertainties", [])[:4]:
+                lines.append(f"- uncertainty: {item}")
+            return lines
         lines = [
             f"skim_reports: {len(payload.get('skim_reports', []))}",
             f"sources_count: {payload.get('sources_count', 0)}",
@@ -171,6 +252,18 @@ def _detail_lines(mode: str, payload: dict[str, Any]) -> list[str]:
         return lines
 
     if mode == "research":
+        if "evidence_graph" in payload:
+            graph = payload.get("evidence_graph", {})
+            lines = [
+                f"graph_nodes: {len(graph.get('nodes', [])) if isinstance(graph, dict) else 0}",
+                f"graph_edges: {len(graph.get('edges', [])) if isinstance(graph, dict) else 0}",
+            ]
+            coverage = payload.get("coverage_report", {})
+            if isinstance(coverage, dict):
+                lines.append(f"stopping_reason: {coverage.get('stopping_reason', 'unknown')}")
+                lines.append(f"nodes_explored: {coverage.get('nodes_explored', 0)}")
+            lines.append(f"sources: {len(payload.get('sources', []))}")
+            return lines
         lines = [
             f"sub_queries: {len(payload.get('sub_queries', []))}",
             f"cluster_reports: {len(payload.get('cluster_reports', []))}",
@@ -186,6 +279,26 @@ def _detail_lines(mode: str, payload: dict[str, Any]) -> list[str]:
         return lines
 
     if mode == "analyze":
+        decision_matrix = payload.get("decision_matrix")
+        if isinstance(decision_matrix, list) and decision_matrix:
+            lines = [
+                f"consensus_claims: {len(payload.get('consensus_claims', []))}",
+                f"disputed_claims: {len(payload.get('disputed_claims', []))}",
+                f"decision_dimensions: {len(decision_matrix)}",
+                f"sources: {len(payload.get('sources', []))}",
+            ]
+            for factor in payload.get("sensitivity_factors", [])[:3]:
+                lines.append(f"- sensitivity: {factor}")
+            return lines
+        if isinstance(decision_matrix, list):
+            lines = [
+                f"consensus_claims: {len(payload.get('consensus_claims', []))}",
+                f"disputed_claims: {len(payload.get('disputed_claims', []))}",
+                f"sources: {len(payload.get('sources', []))}",
+            ]
+            for factor in payload.get("sensitivity_factors", [])[:3]:
+                lines.append(f"- sensitivity: {factor}")
+            return lines
         lines = [
             f"analyze_agents: {payload.get('agent_count', 0)}",
             f"merge_agents: {payload.get('merge_agent_count', 0)}",
@@ -221,9 +334,31 @@ def _extract_signal_lines(text: str, max_lines: int = 4) -> list[str]:
 def _tui_consumer_summary(mode: str, payload: dict[str, Any]) -> str:
     """TUI-only synthesis that mimics an MCP consumer reading many reports."""
     if mode == "peek":
-        return ""
+        sources = payload.get("sources", [])
+        if not isinstance(sources, list) or not sources:
+            return "No sources returned."
+        lines = [
+            "# Peek Result",
+            "",
+            "## Top Sources",
+        ]
+        for src in sources[:6]:
+            lines.append(f"- {src.get('source_id', 'src')} {src.get('url', '')}")
+        return "\n".join(lines)
 
     if mode == "skim":
+        if payload.get("final_answer"):
+            lines = [
+                "# Skim Final Answer",
+                "",
+                payload.get("final_answer", "").strip(),
+            ]
+            uncertainties = payload.get("uncertainties", [])
+            if uncertainties:
+                lines.extend(["", "## Uncertainties"])
+                for item in uncertainties[:5]:
+                    lines.append(f"- {item}")
+            return "\n".join(lines).strip()
         reports = payload.get("skim_reports", [])
         if not reports:
             return payload.get("report", "No skim reports returned.")
@@ -245,6 +380,18 @@ def _tui_consumer_summary(mode: str, payload: dict[str, Any]) -> str:
         return "\n".join(lines).strip()
 
     if mode == "research":
+        if payload.get("final_synthesis"):
+            lines = [
+                "# Research Final Synthesis",
+                "",
+                payload.get("final_synthesis", "").strip(),
+            ]
+            open_questions = payload.get("open_questions", [])
+            if open_questions:
+                lines.extend(["", "## Open Questions"])
+                for item in open_questions[:5]:
+                    lines.append(f"- {item}")
+            return "\n".join(lines).strip()
         blocks = payload.get("synthesis_reports", [])
         if not blocks:
             return payload.get("final_report", "No synthesis reports were returned.")
@@ -280,6 +427,38 @@ def _tui_consumer_summary(mode: str, payload: dict[str, Any]) -> str:
         return "\n".join(lines).strip()
 
     if mode == "analyze":
+        if payload.get("recommended_position"):
+            decision_matrix = payload.get("decision_matrix")
+            fact_style = isinstance(decision_matrix, list) and not decision_matrix
+            lines = [
+                "# Analyze Findings" if fact_style else "# Analyze Recommendation",
+                "",
+                payload.get("recommended_position", "").strip(),
+            ]
+            if fact_style:
+                lines.extend(
+                    [
+                        "",
+                        f"Fact claims reviewed: {len(payload.get('consensus_claims', []))}",
+                    ]
+                )
+                disputed_count = len(payload.get("disputed_claims", []))
+                if disputed_count:
+                    lines.append(f"Disputed claims: {disputed_count}")
+            else:
+                lines.extend(
+                    [
+                        "",
+                        f"Consensus claims: {len(payload.get('consensus_claims', []))}",
+                        f"Disputed claims: {len(payload.get('disputed_claims', []))}",
+                    ]
+                )
+            factors = payload.get("sensitivity_factors", [])
+            if factors:
+                lines.extend(["", "## Sensitivity Factors"])
+                for item in factors[:5]:
+                    lines.append(f"- {item}")
+            return "\n".join(lines).strip()
         base_reports = payload.get("agent_reports", [])
         merges = payload.get("merge_reports", [])
         lines = [
@@ -325,6 +504,14 @@ def _tui_consumer_summary(mode: str, payload: dict[str, Any]) -> str:
 
 def _render_report_text(mode: str, payload: dict[str, Any]) -> str:
     if mode == "skim":
+        if payload.get("final_answer"):
+            parts = [payload.get("final_answer", "").strip(), "", "## Claims"]
+            for claim in payload.get("claims", [])[:12]:
+                parts.append(
+                    f"- {claim.get('claim_id', '?')}: {claim.get('statement', '')} "
+                    f"[{claim.get('confidence_tier', 'unknown')}]"
+                )
+            return "\n".join(parts).strip()
         reports = payload.get("skim_reports", [])
         if not reports:
             return (payload.get("report") or "").strip()
@@ -337,6 +524,17 @@ def _render_report_text(mode: str, payload: dict[str, Any]) -> str:
         return "\n\n".join(blocks).strip()
 
     if mode == "research":
+        if payload.get("final_synthesis"):
+            graph = payload.get("evidence_graph", {})
+            nodes = len(graph.get("nodes", [])) if isinstance(graph, dict) else 0
+            edges = len(graph.get("edges", [])) if isinstance(graph, dict) else 0
+            lines = [
+                payload.get("final_synthesis", "").strip(),
+                "",
+                f"Graph nodes: {nodes}",
+                f"Graph edges: {edges}",
+            ]
+            return "\n".join(lines).strip()
         synthesis = payload.get("synthesis_reports", [])
         if not synthesis:
             return payload.get("final_report", "No synthesis reports returned.")
@@ -352,6 +550,36 @@ def _render_report_text(mode: str, payload: dict[str, Any]) -> str:
         return "\n\n".join(blocks).strip()
 
     if mode == "analyze":
+        if payload.get("recommended_position"):
+            decision_matrix = payload.get("decision_matrix")
+            if isinstance(decision_matrix, list) and not decision_matrix:
+                lines = [payload.get("recommended_position", "").strip()]
+                disputed = len(payload.get("disputed_claims", []))
+                lines.append("")
+                lines.append(f"Fact claims reviewed: {len(payload.get('consensus_claims', []))}")
+                if disputed:
+                    lines.append(f"Disputed claims: {disputed}")
+                factors = payload.get("sensitivity_factors", [])
+                if factors:
+                    lines.extend(["", "## Sensitivity Factors"])
+                    for item in factors[:5]:
+                        lines.append(f"- {item}")
+                return "\n".join(lines).strip()
+
+            lines = [
+                payload.get("recommended_position", "").strip(),
+                "",
+                "## Decision Matrix",
+            ]
+            for row in decision_matrix or []:
+                lines.append(f"### {row.get('dimension', 'Dimension')}")
+                for option in row.get("options", []):
+                    lines.append(
+                        f"- {option.get('option_name', 'Option')}: score={option.get('score', 0)} "
+                        f":: {option.get('rationale', '')}"
+                    )
+                lines.append("")
+            return "\n".join(lines).strip()
         base = (payload.get("report") or "").strip()
         merges = payload.get("merge_reports", [])
         if not merges:
@@ -368,7 +596,14 @@ def _render_report_text(mode: str, payload: dict[str, Any]) -> str:
             parts.append("")
         return "\n".join(parts).strip()
 
-    return (payload.get("report") or payload.get("final_report") or "").strip()
+    return (
+        payload.get("final_answer")
+        or payload.get("recommended_position")
+        or payload.get("final_synthesis")
+        or payload.get("report")
+        or payload.get("final_report")
+        or ""
+    ).strip()
 
 
 def _render_result_console(console: Console, mode: str, payload: dict[str, Any]) -> None:
@@ -424,7 +659,7 @@ async def run_tui(args: argparse.Namespace) -> int:
                 continue
             if cmd == "mode":
                 candidate = arg.strip().lower()
-                if candidate in MODES:
+                if candidate in QUERY_MODES:
                     mode = candidate
                     console.print(f"Mode set to [bold]{mode}[/bold]")
                 else:
@@ -468,9 +703,13 @@ async def run_tui(args: argparse.Namespace) -> int:
         last_payload = result.payload
 
         _render_result_console(console, mode, result.payload)
-        count = result.payload.get("sources_count") or result.payload.get("total_sources") or 0
-        took = result.payload.get("search_time", "?")
-        console.print(f"Done. mode={mode} sources={count} time={took}s", style="green")
+        count = result.payload.get("sources_count") or result.payload.get("total_sources")
+        if count is None:
+            count = len(result.payload.get("sources", []))
+        meta = result.payload.get("_meta", {})
+        took = meta.get("compute_ms", "?") if isinstance(meta, dict) else result.payload.get("search_time", "?")
+        suffix = "ms" if isinstance(meta, dict) and meta.get("compute_ms") is not None else "s"
+        console.print(f"Done. mode={mode} sources={count} time={took}{suffix}", style="green")
 
 
 def parse_args() -> argparse.Namespace:
@@ -493,13 +732,49 @@ def parse_args() -> argparse.Namespace:
         default=4000,
         help="For peek mode, max fetched characters per source",
     )
+    parser.add_argument(
+        "--output",
+        choices=["text", "json", "markdown"],
+        default="text",
+        help="Output format for direct mode",
+    )
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Shortcut to print JSON output (same as --output json)",
+    )
     parser.add_argument("--save-md", default=None, help="Write report to markdown file")
     return parser.parse_args()
 
 
 async def run_direct(args: argparse.Namespace) -> int:
-    if not args.mode or not args.query:
-        raise SystemExit("Direct mode requires: expressindex <mode> \"query\"")
+    output = "json" if args.json else args.output
+
+    if not args.mode:
+        raise SystemExit("Direct mode requires a mode")
+
+    if args.mode in QUERY_MODES and not args.query:
+        raise SystemExit("Query mode requires: expressindex <mode> \"query\"")
+
+    if args.mode == "status":
+        status_bundle = await call_status_bundle(args.mcp_url)
+        if output == "json":
+            print(json.dumps(status_bundle, indent=2))
+        elif output == "markdown":
+            print("# ExpressIndex Status\n\n```json\n" + json.dumps(status_bundle, indent=2) + "\n```")
+        else:
+            print(_render_status_text(status_bundle))
+        return 0
+
+    if args.mode == "metrics":
+        metrics_payload = await call_metrics(args.mcp_url)
+        if output == "json":
+            print(json.dumps(metrics_payload, indent=2))
+        elif output == "markdown":
+            print("# ExpressIndex Metrics\n\n```json\n" + json.dumps(metrics_payload, indent=2) + "\n```")
+        else:
+            print(_render_metrics_text(metrics_payload))
+        return 0
 
     result = await call_mcp_tool(
         mode=args.mode,
@@ -511,11 +786,23 @@ async def run_direct(args: argparse.Namespace) -> int:
         max_content_chars=args.max_content_chars,
     )
     payload = result.payload
-    report = _tui_consumer_summary(args.mode, payload) or payload.get("report") or payload.get("final_report")
-    if report:
-        print(report)
-    else:
+    if output == "json":
         print(json.dumps(payload, indent=2))
+    elif output == "markdown":
+        print(markdown_from_result(args.query, args.mode, payload))
+    else:
+        report = (
+            _tui_consumer_summary(args.mode, payload)
+            or payload.get("final_answer")
+            or payload.get("recommended_position")
+            or payload.get("final_synthesis")
+            or payload.get("report")
+            or payload.get("final_report")
+        )
+        if report:
+            print(report)
+        else:
+            print(json.dumps(payload, indent=2))
 
     if args.save_md:
         Path(args.save_md).write_text(markdown_from_result(args.query, args.mode, payload), encoding="utf-8")

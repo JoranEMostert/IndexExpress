@@ -3,9 +3,11 @@ llm_api_key: ""
 llm_model_id: local-model
 llm_timeout: 0
 llm_max_parallel: 4
+llm_retries: 2
 
 searxng_url: ${SEARXNG_URL}
 searxng_timeout: 0
+searxng_retries: 2
 
 max_concurrent_agents: 7
 agent_timeout: 60
@@ -21,3 +23,11 @@ research_sources_per_sub_query: 8
 mcp_host: 0.0.0.0
 mcp_port: 8000
 log_level: INFO
+log_format: text
+query_max_length: 600
+readiness_require_llm: true
+tool_timeout_peek: 30
+tool_timeout_skim: 120
+tool_timeout_analyze: 300
+tool_timeout_research: 900
+http_retry_base_ms: 250

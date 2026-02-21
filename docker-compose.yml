@@ -10,29 +10,29 @@ services:
       - SEARXNG_DEFAULT_LANG=en
       - SEARXNG_INSTANCE_NAME=expressindex-search
     volumes:
-      - ./searxng/settings.yml:/etc/searxng/settings.yml:ro
+      - ./searxng/settings.yml:/etc/searxng/settings.yml:Z
     networks:
       - mcp-network
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/healthz')"]
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8080/healthz >/dev/null 2>&1 || exit 1"]
       interval: 30s
       timeout: 10s
       retries: 3
 
   mcp-server:
     build:
-      context: ./mcp-server
-      dockerfile: Dockerfile
+      context: .
+      dockerfile: mcp-server/Dockerfile
     container_name: expressindex-mcp-server
-    ports:
-      - "8000:8000"
+    network_mode: host
     environment:
-      - SEARXNG_URL=http://searxng:8080
-      - LLM_API_URL=${LLM_API_URL:-http://host.docker.internal:1234/v1}
+      - SEARXNG_URL=${SEARXNG_URL:-http://localhost:8888}
+      - LLM_API_URL=${LLM_API_URL:-http://localhost:1234/v1}
       - LLM_API_KEY=${LLM_API_KEY:-}
       - LLM_MODEL_ID=${LLM_MODEL_ID:-}
       - LLM_TIMEOUT=${LLM_TIMEOUT:-0}
       - LLM_MAX_PARALLEL=${LLM_MAX_PARALLEL:-4}
+      - LLM_RETRIES=${LLM_RETRIES:-2}
       - MAX_CONCURRENT_AGENTS=${MAX_CONCURRENT_AGENTS:-7}
       - PEEK_MAX_URLS=${PEEK_MAX_URLS:-5}
       - SKIM_MAX_URLS=${SKIM_MAX_URLS:-15}
@@ -43,15 +43,23 @@ services:
       - RESEARCH_MAX_SUB_QUERIES=${RESEARCH_MAX_SUB_QUERIES:-}
       - RESEARCH_SOURCES_PER_SUB_QUERY=${RESEARCH_SOURCES_PER_SUB_QUERY:-8}
       - SEARXNG_TIMEOUT=${SEARXNG_TIMEOUT:-0}
+      - SEARXNG_RETRIES=${SEARXNG_RETRIES:-2}
+      - QUERY_MAX_LENGTH=${QUERY_MAX_LENGTH:-600}
+      - READINESS_REQUIRE_LLM=${READINESS_REQUIRE_LLM:-true}
+      - TOOL_TIMEOUT_PEEK=${TOOL_TIMEOUT_PEEK:-30}
+      - TOOL_TIMEOUT_SKIM=${TOOL_TIMEOUT_SKIM:-120}
+      - TOOL_TIMEOUT_ANALYZE=${TOOL_TIMEOUT_ANALYZE:-300}
+      - TOOL_TIMEOUT_RESEARCH=${TOOL_TIMEOUT_RESEARCH:-900}
+      - HTTP_RETRY_BASE_MS=${HTTP_RETRY_BASE_MS:-250}
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - LOG_FORMAT=${LOG_FORMAT:-text}
     volumes:
-      - ./mcp-server:/app
+      - ./mcp-server:/app:Z
+      - ./expressindex_core:/app/expressindex_core:Z
       - mcp-data:/app/data
     depends_on:
       searxng:
         condition: service_healthy
-    networks:
-      - mcp-network
     stdin_open: true
     tty: true
 

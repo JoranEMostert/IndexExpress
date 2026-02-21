@@ -2,6 +2,7 @@ import aiohttp
 import asyncio
 import json
 import logging
+import random
 from typing import AsyncIterator, List, Dict, Any, Optional
 from dataclasses import dataclass
 
@@ -23,12 +24,39 @@ class LLMClient:
         api_url: str, 
         api_key: Optional[str] = None,
         model: str = "local-model",
-        timeout: Optional[int] = None
+        timeout: Optional[int] = None,
+        retries: int = 2,
+        retry_base_ms: int = 250,
     ):
         self.api_url = api_url.rstrip('/')
         self.api_key = api_key
         self.model = model
         self.timeout = timeout
+        self.retries = max(0, retries)
+        self.retry_base_ms = max(20, retry_base_ms)
+        self._session: aiohttp.ClientSession | None = None
+        self._session_lock = asyncio.Lock()
+
+    def _retry_delay(self, attempt: int) -> float:
+        base = self.retry_base_ms / 1000.0
+        jitter = random.uniform(0, base * 0.2)
+        return (base * (2**attempt)) + jitter
+
+    @staticmethod
+    def _is_retryable_status(status: int) -> bool:
+        return status in {408, 409, 425, 429} or status >= 500
+
+    async def _get_session(self) -> aiohttp.ClientSession:
+        async with self._session_lock:
+            if self._session is None or self._session.closed:
+                self._session = aiohttp.ClientSession()
+            return self._session
+
+    async def close(self) -> None:
+        async with self._session_lock:
+            if self._session is not None and not self._session.closed:
+                await self._session.close()
+            self._session = None
 
     def _request_timeout(self) -> aiohttp.ClientTimeout:
         if self.timeout is None or self.timeout <= 0:
@@ -57,48 +85,73 @@ class LLMClient:
         }
         if max_tokens:
             payload['max_tokens'] = max_tokens
-            
-        try:
-            async with aiohttp.ClientSession() as session:
+
+        for attempt in range(self.retries + 1):
+            try:
+                session = await self._get_session()
                 async with session.post(
-                    url, 
-                    json=payload, 
+                    url,
+                    json=payload,
                     headers=headers,
                     timeout=self._request_timeout()
                 ) as response:
                     if response.status != 200:
                         error = await response.text()
-                        logger.error(f"LLM API error: {response.status} - {error}")
+                        retryable = self._is_retryable_status(response.status)
+                        if retryable and attempt < self.retries:
+                            logger.warning(
+                                "LLM API retrying after status=%s attempt=%s", response.status, attempt + 1
+                            )
+                            await asyncio.sleep(self._retry_delay(attempt))
+                            continue
+                        logger.error("LLM API error: %s - %s", response.status, error)
                         return LLMResponse(
                             content=f"Error: API returned {response.status}",
                             model=self.model,
                             usage={'prompt': 0, 'completion': 0}
                         )
-                    
+
                     data = await response.json()
                     choice = data.get('choices', [{}])[0]
                     message = choice.get('message', {})
-                    
+
                     return LLMResponse(
                         content=message.get('content', ''),
                         model=data.get('model', self.model),
                         usage=data.get('usage', {'prompt_tokens': 0, 'completion_tokens': 0})
                     )
-                    
-        except asyncio.TimeoutError:
-            logger.error("LLM request timeout")
-            return LLMResponse(
-                content="Error: Request timeout",
-                model=self.model,
-                usage={}
-            )
-        except Exception as e:
-            logger.error(f"LLM request error: {e}")
-            return LLMResponse(
-                content=f"Error: {str(e)}",
-                model=self.model,
-                usage={}
-            )
+
+            except asyncio.TimeoutError:
+                if attempt < self.retries:
+                    logger.warning("LLM request timeout; retrying attempt=%s", attempt + 1)
+                    await asyncio.sleep(self._retry_delay(attempt))
+                    continue
+                logger.error("LLM request timeout")
+                return LLMResponse(
+                    content="Error: Request timeout",
+                    model=self.model,
+                    usage={}
+                )
+            except aiohttp.ClientError as e:
+                if attempt < self.retries:
+                    logger.warning("LLM client error; retrying attempt=%s err=%s", attempt + 1, e)
+                    await asyncio.sleep(self._retry_delay(attempt))
+                    continue
+                logger.error("LLM request error: %s", e)
+                return LLMResponse(
+                    content=f"Error: {str(e)}",
+                    model=self.model,
+                    usage={}
+                )
+            except Exception as e:
+                logger.error("LLM request error: %s", e)
+                return LLMResponse(
+                    content=f"Error: {str(e)}",
+                    model=self.model,
+                    usage={}
+                )
+
+        return LLMResponse(content="Error: Request failed", model=self.model, usage={})
             
     async def complete(
         self,
@@ -131,32 +184,32 @@ class LLMClient:
         if max_tokens:
             payload['max_tokens'] = max_tokens
 
-        async with aiohttp.ClientSession() as session:
-            async with session.post(
-                url,
-                json=payload,
-                headers=headers,
-                timeout=self._request_timeout(),
-            ) as response:
-                if response.status != 200:
-                    body = await response.text()
-                    raise RuntimeError(f"Stream request failed: {response.status} - {body}")
+        session = await self._get_session()
+        async with session.post(
+            url,
+            json=payload,
+            headers=headers,
+            timeout=self._request_timeout(),
+        ) as response:
+            if response.status != 200:
+                body = await response.text()
+                raise RuntimeError(f"Stream request failed: {response.status} - {body}")
 
-                async for raw_line in response.content:
-                    line = raw_line.decode("utf-8", errors="ignore").strip()
-                    if not line.startswith("data:"):
-                        continue
-                    payload_text = line[5:].strip()
-                    if payload_text == "[DONE]":
-                        break
-                    try:
-                        chunk = json.loads(payload_text)
-                        delta = chunk.get("choices", [{}])[0].get("delta", {})
-                        content = delta.get("content", "")
-                        if content:
-                            yield content
-                    except json.JSONDecodeError:
-                        continue
+            async for raw_line in response.content:
+                line = raw_line.decode("utf-8", errors="ignore").strip()
+                if not line.startswith("data:"):
+                    continue
+                payload_text = line[5:].strip()
+                if payload_text == "[DONE]":
+                    break
+                try:
+                    chunk = json.loads(payload_text)
+                    delta = chunk.get("choices", [{}])[0].get("delta", {})
+                    content = delta.get("content", "")
+                    if content:
+                        yield content
+                except json.JSONDecodeError:
+                    continue
 
     async def stream_complete(
         self,
@@ -172,11 +225,11 @@ class LLMClient:
         """Check if LLM API is reachable."""
         try:
             url = f"{self.api_url}/models"
-            async with aiohttp.ClientSession() as session:
-                async with session.get(
-                    url,
-                    timeout=aiohttp.ClientTimeout(total=5)
-                ) as response:
-                    return response.status == 200
+            session = await self._get_session()
+            async with session.get(
+                url,
+                timeout=aiohttp.ClientTimeout(total=5)
+            ) as response:
+                return response.status == 200
         except Exception:
             return False
