@@ -98,8 +98,8 @@ expressindex/
 
 ### Phase 2 - Introduce Explicit Boundaries
 
-- [x] Create a clear package root for runtime code (single Python package namespace). - IN PROGRESS
-- [x] Replace cross-folder relative-style imports with package imports. - IN PROGRESS
+- [ ] Create a clear package root for runtime code (single Python package namespace).
+- [ ] Replace cross-folder relative-style imports with package imports.
 - [ ] Introduce `schemas.py` for shared payload dataclasses/types.
 - [x] Introduce `contracts.py` for MCP tool names, aliases, and schema version constants. - DONE (OpenCode)
 - [x] Introduce `errors.py` for shared error codes/types. - DONE (OpenCode)
@@ -124,15 +124,15 @@ expressindex/
 
 ### Phase 4 - Split `workflow_primitives.py` by Concern
 
-- [x] Extract URL/domain utilities (`normalize_url`, trust, host category) into `core/url_utils.py`. - DONE (OpenCode)
-- [x] Extract query classification into `core/query_mode.py`. - DONE (OpenCode)
+- [ ] Extract URL/domain utilities (`normalize_url`, trust, host category) into `core/url_utils.py`.
+- [ ] Extract query classification into `core/query_mode.py`.
 - [ ] Extract scoring/ranking into `core/ranking.py`.
-- [x] Extract quote cleaning and evidence extraction into `core/evidence.py`. - DONE (OpenCode)
-- [x] Extract claim graph logic into `core/claims.py`. - DONE (OpenCode)
+- [ ] Extract quote cleaning and evidence extraction into `core/evidence.py`.
+- [ ] Extract claim graph logic into `core/claims.py`.
 - [ ] Extract summary/meta helpers into `core/summary_meta.py`.
 - [ ] Move hard-coded topic-specific heuristics (slug disambiguation) behind explicit hook or plugin.
 - [ ] If topic heuristics stay, isolate into `core/topic_overrides.py`.
-- [x] Keep a thin compatibility module exporting old names during migration. - DONE (core/__init__.py)
+- [ ] Keep a thin compatibility module exporting old names during migration.
 - [ ] Update tests to import new modules directly once stable.
 
 ### Phase 5 - Simplify `deepresearch.py`
