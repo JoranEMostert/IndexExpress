@@ -13,17 +13,20 @@ from typing import Any, Dict
 
 from aiohttp import web
 
+from compat import resolve_tool_name
 from config import CONFIG, list_llm_models
+from contracts import SCHEMA_VERSION
+from errors import JSONRPC_INVALID_PARAMS, ERROR_TYPE_VALIDATION
 from logging_utils import configure_logging
 from request_context import request_id_var
 from search.searxng_client import SearXNGClient
 from search.llm_client import LLMClient
-from agents.quicksearch import PeekAgent, SkimAgent, QuickSearchAgent
+from agents.quicksearch import PeekAgent, QuickSearchAgent
 from agents.deepresearch import AnalyzeOrchestrator, DeepSearchOrchestrator
 from telemetry import MetricsRegistry
+from timeouts import get_tool_timeout
 from utils.sanitize import strip_think_tags
-
-SCHEMA_VERSION = "v2.0"
+from validation import validate_query_tool_args, validate_fetch_url_args
 configure_logging(CONFIG.get("log_level", "INFO"), CONFIG.get("log_format", "text"))
 logger = logging.getLogger("expressindex-mcp")
 
@@ -56,13 +59,6 @@ class MCPRequestHandler:
             max_urls=CONFIG.get('peek_max_urls', 5)
         )
 
-        self.skim = SkimAgent(
-            searxng_client=self.searxng,
-            llm_client=self.llm,
-            max_urls=CONFIG.get('skim_max_urls', 15),
-            agent_count=CONFIG.get('skim_agent_count', 1),
-        )
-
         self.quicksearch = QuickSearchAgent(
             searxng_client=self.searxng,
             llm_client=self.llm,
@@ -90,12 +86,6 @@ class MCPRequestHandler:
         self.session_id = str(uuid.uuid4())
         self.metrics = MetricsRegistry()
         self.query_max_length = int(CONFIG.get("query_max_length", 600))
-        self.tool_timeouts = {
-            "peek": int(CONFIG.get("tool_timeout_peek", 30)),
-            "skim": int(CONFIG.get("tool_timeout_skim", 120)),
-            "analyze": int(CONFIG.get("tool_timeout_analyze", 300)),
-            "research": int(CONFIG.get("tool_timeout_research", 900)),
-        }
         logger.info("MCP Server initialized", extra={"status": "ok", "method": "boot"})
 
     @staticmethod
@@ -118,7 +108,7 @@ class MCPRequestHandler:
         return (-32603, str(exc), "internal_error")
 
     async def _run_with_timeout(self, tool_name: str, coro: Any) -> Any:
-        timeout_s = int(self.tool_timeouts.get(tool_name, 0) or 0)
+        timeout_s = get_tool_timeout(tool_name, CONFIG)
         if timeout_s <= 0:
             return await coro
         return await asyncio.wait_for(coro, timeout=timeout_s)
@@ -376,53 +366,23 @@ class MCPRequestHandler:
 
         if not isinstance(arguments, dict):
             record_tool('error', 'validation_error')
-            return self._error_payload(-32602, 'Invalid params: arguments must be an object', 'validation_error')
+            return self._error_payload(JSONRPC_INVALID_PARAMS, 'Invalid params: arguments must be an object', ERROR_TYPE_VALIDATION)
 
-        aliases = {'quicksearch': 'skim', 'deepresearch': 'research'}
-        resolved_tool_name = aliases.get(str(tool_name), str(tool_name))
+        resolved_tool_name = resolve_tool_name(str(tool_name or ""))
         metric_tool_name = resolved_tool_name
 
         if resolved_tool_name in {'peek', 'skim', 'analyze', 'research'}:
-            query = arguments.get('query')
-            if not isinstance(query, str) or not query.strip():
+            is_valid, error_response = validate_query_tool_args(arguments, resolved_tool_name, self.query_max_length)
+            if not is_valid:
                 record_tool('error', 'validation_error')
-                return self._error_payload(-32602, 'Invalid params: query must be a non-empty string', 'validation_error')
+                return error_response
 
-            if len(query.strip()) > self.query_max_length:
+        if resolved_tool_name == 'fetch_url':
+            is_valid, error_response = validate_fetch_url_args(arguments)
+            if not is_valid:
                 record_tool('error', 'validation_error')
-                return self._error_payload(
-                    -32602,
-                    f'Invalid params: query length exceeds max {self.query_max_length}',
-                    'validation_error',
-                )
+                return error_response
 
-            if arguments.get("max_results") is not None:
-                max_results = arguments.get("max_results")
-                if not isinstance(max_results, int) or max_results <= 0:
-                    record_tool('error', 'validation_error')
-                    return self._error_payload(-32602, 'Invalid params: max_results must be a positive integer', 'validation_error')
-
-            if resolved_tool_name == "research" and arguments.get("num_sub_queries") is not None:
-                sub_q = arguments.get("num_sub_queries")
-                if not isinstance(sub_q, int) or sub_q <= 0:
-                    record_tool('error', 'validation_error')
-                    return self._error_payload(
-                        -32602, 'Invalid params: num_sub_queries must be a positive integer', 'validation_error'
-                    )
-
-            if resolved_tool_name == "analyze" and arguments.get("options") is not None:
-                options = arguments.get("options")
-                if not isinstance(options, list):
-                    record_tool('error', 'validation_error')
-                    return self._error_payload(-32602, 'Invalid params: options must be an array of strings', 'validation_error')
-                if len(options) > 8:
-                    record_tool('error', 'validation_error')
-                    return self._error_payload(-32602, 'Invalid params: options must contain at most 8 items', 'validation_error')
-                for option in options:
-                    if not isinstance(option, str) or not option.strip():
-                        record_tool('error', 'validation_error')
-                        return self._error_payload(-32602, 'Invalid params: each option must be a non-empty string', 'validation_error')
-        
         logger.info(
             "Calling tool",
             extra={
@@ -568,31 +528,11 @@ class MCPRequestHandler:
                 return self._text_content({'models': models, 'api_url': CONFIG['llm_api_url']})
 
             elif resolved_tool_name == 'fetch_url':
-                url = arguments.get('url')
-                if not isinstance(url, str) or not url.strip():
-                    record_tool('error', 'validation_error')
-                    return self._error_payload(-32602, 'Invalid params: url must be a non-empty string', 'validation_error')
-                trimmed = url.strip()
-                if not (trimmed.startswith('http://') or trimmed.startswith('https://')):
-                    record_tool('error', 'validation_error')
-                    return self._error_payload(
-                        -32602,
-                        'Invalid params: url must start with http:// or https://',
-                        'validation_error',
-                    )
-
+                url = arguments.get('url', '').strip()
                 max_chars = arguments.get('max_chars', 4000)
-                if not isinstance(max_chars, int) or max_chars <= 0:
-                    record_tool('error', 'validation_error')
-                    return self._error_payload(
-                        -32602,
-                        'Invalid params: max_chars must be a positive integer',
-                        'validation_error',
-                    )
-
-                fetched = await self.searxng.fetch_url_content(trimmed, max_length=min(max_chars, 12000))
+                fetched = await self.searxng.fetch_url_content(url, max_length=min(max_chars, 12000))
                 record_tool('ok')
-                return self._text_content({'url': trimmed, 'fetched_markdown': fetched, 'chars': len(fetched)})
+                return self._text_content({'url': url, 'fetched_markdown': fetched, 'chars': len(fetched)})
                 
             else:
                 record_tool('error', 'unknown_tool')

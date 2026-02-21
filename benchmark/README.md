@@ -12,6 +12,13 @@ Simple benchmark runner for collecting repeatable mode-level performance and pay
   - CSV (flat rows for quick spreadsheet/charting)
   - Markdown (human-readable summary)
 
+## Artifact retention policy
+
+- Benchmark outputs are treated as ephemeral local artifacts.
+- `benchmark/output_reports/` is git-ignored for `*.json`, `*.csv`, and `*.md`.
+- Only `benchmark/output_reports/.gitkeep` is tracked to preserve the directory layout.
+- If a benchmark result must be shared long-term, export it outside the repository tree.
+
 ## Usage
 
 From repo root:

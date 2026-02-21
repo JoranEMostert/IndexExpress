@@ -251,5 +251,4 @@ Legacy alias still supported:
 - Reporting engine: `mcp-server/reporting.py`
 - Search/LLM clients: `mcp-server/search/searxng_client.py`, `mcp-server/search/llm_client.py`
 - ExpressIndex CLI/TUI: `expressindex_cli/main.py`
-- Legacy helper script: `mcp-server/tui.py`
 - Skill profile: `.agents/skills/searxng-mcp-research/SKILL.md`

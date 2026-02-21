@@ -1,0 +1,14 @@
+# ExpressIndex Skim Report
+
+Query: best python web framework for startup MVP
+
+# Skim Final Answer
+
+FastAPI is usually the strongest default for a startup MVP because it combines fast development, modern typing, and async performance. Django is often the better choice when your team needs batteries-included admin workflows and mature built-in conventions.
+
+## Uncertainties
+- Performance depends heavily on database design and deployment setup.
+- Team familiarity can outweigh framework feature differences in early-stage velocity.
+
+Compute time: 1240ms
+Token estimate: 980
