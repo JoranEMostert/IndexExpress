@@ -1,6 +1,8 @@
+from expressindex_core.sanitize import strip_think_tags as core_strip_think_tags  # noqa: E402
 from expressindex_cli.main import _sanitize_payload  # noqa: E402
 from reporting import strip_think_blocks  # noqa: E402
 from server import _strip_think_tags  # noqa: E402
+from utils.sanitize import strip_think_tags as server_utils_strip_think_tags  # noqa: E402
 
 
 def test_strip_think_blocks_removes_reasoning():
@@ -21,6 +23,14 @@ def test_strip_think_blocks_keeps_final_answer_after_think():
 def test_server_strip_think_tags_is_case_insensitive():
     text = "intro<THINK>private</THINK>done"
     assert _strip_think_tags(text) == "introdone"
+
+
+def test_all_sanitize_import_paths_match_behavior():
+    text = "start<think>hidden</think>end"
+    expected = "startend"
+    assert core_strip_think_tags(text) == expected
+    assert server_utils_strip_think_tags(text) == expected
+    assert _strip_think_tags(text) == expected
 
 
 def test_cli_payload_sanitizes_top_level_and_clusters():

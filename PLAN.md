@@ -106,20 +106,20 @@ expressindex/
 - [x] Introduce `validation.py` for all incoming request validation. - DONE (OpenCode)
 - [x] Introduce `timeouts.py` for tool timeout policy. - DONE (OpenCode)
 - [x] Introduce `compat.py` for temporary backward compatibility decisions. - DONE (OpenCode)
-- [ ] Define strict boundaries: server layer cannot contain ranking/evidence internals.
-- [ ] Define strict boundaries: agent layer cannot format CLI text.
+- [x] Define strict boundaries: server layer cannot contain ranking/evidence internals. - DONE (OpenCode)
+- [x] Define strict boundaries: agent layer cannot format CLI text. - DONE (OpenCode)
 
 ### Phase 3 - Split `server.py` into Focused Modules
 
 - [ ] Extract MCP method routing from `MCPRequestHandler` into `routes.py`.
 - [ ] Extract `tools/list` schema definition into `tool_catalog.py`.
-- [ ] Extract request validation from `_handle_tools_call` into `tool_validation.py`.
+- [x] Extract request validation from `_handle_tools_call` into `tool_validation.py`. - DONE (`validation.py`)
 - [ ] Extract tool execution dispatch into `tool_dispatch.py`.
 - [ ] Extract response envelope helpers (`_error_payload`, `_text_content`) into `responses.py`.
 - [ ] Extract health/ready/metrics endpoint logic into `status_handlers.py`.
 - [ ] Extract app bootstrap and aiohttp wiring into `app.py`.
 - [ ] Replace long `if/elif` tool dispatch with dict-based registry.
-- [ ] Centralize alias resolution in one function.
+- [x] Centralize alias resolution in one function. - DONE (`compat.resolve_tool_name`)
 - [ ] Add unit tests for each dispatcher and validator branch.
 
 ### Phase 4 - Split `workflow_primitives.py` by Concern
@@ -175,8 +175,8 @@ expressindex/
 - [x] Remove fallback duplicate implementation in `mcp-server/utils/sanitize.py`. - DONE (OpenCode)
 - [x] Keep one canonical sanitize implementation in shared core package. - DONE (OpenCode)
 - [x] Update server, reporting, and CLI to consume the same sanitizer import path. - DONE (OpenCode)
-- [ ] Add one test module for sanitize behavior and import it from all consumers.
-- [ ] Consolidate duplicated `normalize_url` implementations.
+- [x] Add one test module for sanitize behavior and import it from all consumers. - DONE (`tests/test_think_tag_sanitization.py`)
+- [x] Consolidate duplicated `normalize_url` implementations. - DONE (`reporting.py` -> `workflow_primitives.normalize_url`)
 - [ ] Add one utility module for URL normalization used everywhere.
 
 ### Phase 9 - Simplify Client Layer
